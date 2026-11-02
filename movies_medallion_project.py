@@ -464,8 +464,8 @@ RATINGS_COLS = ["tconst", "averageRating", "numVotes"]
 
 # ------------------------------- BRONZE --------------------------------------
 # TSV do IMDb: separador tab e sem aspas (os títulos podem conter aspas).
-basics_raw  = read_raw_csv(f"{SRC}/title.basics.movies.tsv.gz",  BASICS_COLS,  sep="\t", quote="")
-ratings_raw = read_raw_csv(f"{SRC}/title.ratings.movies.tsv.gz", RATINGS_COLS, sep="\t", quote="")
+basics_raw  = read_raw_csv(f"{SRC}/title.basics.tsv.gz",  BASICS_COLS,  sep="\t", quote="")
+ratings_raw = read_raw_csv(f"{SRC}/title.ratings.tsv.gz", RATINGS_COLS, sep="\t", quote="")
 
 write_delta(with_audit(basics_raw, "imdb"), BRONZE, "imdb_title_basics",
             comment="IMDb title.basics (só filmes), valores brutos em string")
