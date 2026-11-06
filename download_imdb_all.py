@@ -9,7 +9,7 @@ Uso:
     python download_imdb_all.py                              # os 7 ficheiros para imdb_data_full\
     python download_imdb_all.py --only title.basics.tsv.gz title.ratings.tsv.gz
     python download_imdb_all.py --force                      # volta a descarregar
-    python download_imdb_all.py --upload /Volumes/abd_project/landing/raw   # + upload (Databricks CLI)
+    python download_imdb_all.py --upload /Volumes/abd_project/bronze/raw   # + upload (Databricks CLI)
 
 Datasets do IMDb: apenas para uso pessoal e não comercial (https://developer.imdb.com/non-commercial-datasets/).
 Alguns ficheiros (principals, akas, name.basics) são grandes: confirma o espaço em disco.
@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--force", action="store_true", help="volta a descarregar mesmo que já existam")
     p.add_argument("--base-url", default=IMDB_BASE, help=argparse.SUPPRESS)
     p.add_argument("--upload", metavar="RAW_ROOT",
-                   help="raiz do Volume, ex.: /Volumes/abd_project/landing/raw (cria a subpasta imdb/)")
+                   help="raiz do Volume, ex.: /Volumes/abd_project/bronze/raw (cria a subpasta imdb/)")
     p.add_argument("--profile", help="profile da Databricks CLI (para o upload)")
     return p.parse_args()
 
@@ -74,7 +74,7 @@ def main():
         print()
         step_upload([p for p in paths if p.exists()], f"{args.upload.rstrip('/')}/imdb", args.profile)
     else:
-        print("\nConcluído. Carrega os ficheiros para o Volume (landing/raw/imdb), ou usa --upload.")
+        print("\nConcluído. Carrega os ficheiros para o Volume (bronze/raw/imdb), ou usa --upload.")
 
 
 if __name__ == "__main__":

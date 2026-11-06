@@ -3,726 +3,959 @@
 # [tool.databricks.environment]
 # environment_version = "6"
 # ///
+displayHTML("""<div style="background:#000; padding:48px 56px; border-left:14px solid #19E06E;">
+<div style="display:inline-block; background:#19E06E; padding:8px 14px; color:#fff;
+    font-family:Arial,sans-serif; font-size:11px; font-weight:800; letter-spacing:2.5px;
+    text-transform:uppercase;">Analyzing Big Data</div>
+<div style="margin-top:28px; font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:54px; font-weight:800; line-height:1; letter-spacing:-2px; color:white;">
+Os Melhores Filmes e Séries</div>
+<div style="margin-top:18px; font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:19px; font-weight:300; letter-spacing:0.5px; color:#D1D5DB;">
+IMDb + TMDB + MovieLens &nbsp;|&nbsp; TP2 - Ano letivo 2026/2027</div>
+<div style="margin-top:50px; font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+    font-size:15px; font-weight:600; letter-spacing:0.8px; color:white;">
+20251694: Francisco Monteiro<br>
+20251843: José Grave<br>
+2025XXXX: Luís Pousada<br>
+2024XXXX: Tiago Felgueira</div></div>""")
+
+# COMMAND ----------
+
 # MAGIC %md
-# MAGIC # Projeto de grupo – Filmes: IMDb + TMDB + MovieLens
+# MAGIC # Definição do problema
 # MAGIC
-# MAGIC **Pergunta de negócio:** as notas dos filmes diferem entre o IMDb, o TMDB e os utilizadores do MovieLens? Que fatores (género, década, idioma, orçamento) explicam essas diferenças?
+# MAGIC **_"Quais são os melhores filmes e séries de todos os tempos?"_**
+# MAGIC **_"Que fatores os tornam no que são?"_**
 # MAGIC
-# MAGIC **Equipa:** _(nomes)_  |  **Data:** _(data de entrega)_
+# MAGIC Estas perguntas dividem críticos, amigos e colegas de grupo há décadas. Apesar de discussões longas e intensas, nunca se chegou a acordo, em parte porque cada pessoa tende a favorecer as suas próprias preferências.
 # MAGIC
-# MAGIC ## Arquitetura (Lakehouse + Medallion)
+# MAGIC Para lhes responder com dados, o grupo faz uma análise exploratória da **qualidade dos conteúdos, medida principalmente pela nota do IMDb**, e estuda os fatores que podem explicar essa qualidade e que devem ser tidos em conta ao recomendar um filme ou uma série: tipo de conteúdo, género, década, duração, popularidade (número de votos) e, nas séries, o número de temporadas e de episódios.
+# MAGIC
+# MAGIC O IMDb é um dos conjuntos de dados mais conhecidos em Data Science e é a **fonte principal** deste projeto. Duas fontes complementares enriquecem os filmes:
+# MAGIC - **MovieLens:** avaliações de utilizadores, uma segunda opinião que permite verificar se a nota do IMDb é consistente;
+# MAGIC - **TMDB:** orçamento, receita e idioma original.
+# MAGIC
+# MAGIC Os dados são organizados numa estrutura **Bronze / Silver / Gold** que suporta a análise deste projeto e pode ser reutilizada por outros analistas.
+# MAGIC
+# MAGIC ## Arquitetura: Data Lakehouse com Medallion Architecture (aula #07)
 # MAGIC
 # MAGIC ```
 # MAGIC  Fontes (descarregadas localmente, porque a Free Edition não acede à internet)
-# MAGIC     IMDb (TSV)   TMDB (JSON)   MovieLens (CSV)
-# MAGIC          \            |            /
-# MAGIC           v           v           v
-# MAGIC   BRONZE  <catalogo>.bronze
-# MAGIC             Volume raw   /Volumes/<catalogo>/bronze/raw/{imdb,tmdb,movielens}   (ficheiros originais)
-# MAGIC                |  leitura com schema explícito
-# MAGIC                v
-# MAGIC             tabelas Delta bronze.*   dados brutos em string + metadados de auditoria
+# MAGIC     IMDb (TSV)            TMDB (JSON)          MovieLens (CSV)
+# MAGIC     fonte principal       complementar         complementar
+# MAGIC          \                    |                    /
+# MAGIC           v                   v                   v
+# MAGIC   BRONZE   Volume /Volumes/abd_project/bronze/raw/...   ficheiros originais
+# MAGIC            tabelas bronze.*   dados brutos + histórico de leituras (_batch_id)
+# MAGIC          |
+# MAGIC          v   validação das features
+# MAGIC   SILVER   tabelas silver.*   dados limpos, tipados e integrados (um título por linha)
 # MAGIC          |
 # MAGIC          v
-# MAGIC   SILVER  <catalogo>.silver.*   limpeza, tipagem, deduplicação e integração das 3 fontes
-# MAGIC          |
-# MAGIC          v
-# MAGIC   GOLD    <catalogo>.gold.*     tabelas agregadas que respondem à pergunta de negócio
+# MAGIC   GOLD     tabelas gold.*     datamart: melhores títulos e fatores de qualidade
 # MAGIC ```
 # MAGIC
-# MAGIC | Camada | Regra | Exemplos neste projeto |
+# MAGIC | Camada | O que guarda | Exemplos neste projeto |
 # MAGIC |---|---|---|
-# MAGIC | Bronze (Volume) | Ficheiros originais, sem alterações | `.tsv.gz`, `.csv`, `.jsonl` no Volume `bronze.raw` |
-# MAGIC | Bronze (tabelas) | Fiel à origem; só se acrescentam metadados (`_source`, `_source_file`, `_ingested_at`) | `bronze.imdb_title_basics`, `bronze.tmdb_movie_details` |
-# MAGIC | Silver | Dados limpos, tipados, sem duplicados e integrados por chave | `silver.imdb_movies`, `silver.movies_unified` |
-# MAGIC | Gold | Pronto para análise e decisão | `gold.ratings_by_decade`, `gold.roi_by_genre` |
+# MAGIC | **Bronze** | Dados tal como vieram da fonte + lote e data de cada leitura | `bronze.imdb_title_basics`, `bronze.ml_ratings` |
+# MAGIC | **Silver** | Dados validados, limpos, tipados e integrados por chave | `silver.imdb_titles`, `silver.titles_unified` |
+# MAGIC | **Gold** | Datamart para responder às perguntas de negócio | `gold.dm_titles`, `gold.top_titles`, `gold.rating_by_factor` |
 # MAGIC
-# MAGIC **Dados estruturados:** notas, votos, orçamento, receita, duração. **Não estruturados:** o JSON bruto do TMDB, as sinopses e as tags de texto livre do MovieLens.
+# MAGIC **Dados estruturados:** notas, votos, duração, temporadas, orçamento, receita. **Dados semi-estruturados e não estruturados:** o JSON do TMDB, as sinopses e as tags de texto livre do MovieLens.
 # MAGIC
-# MAGIC **Chaves de integração:** o `links.csv` do MovieLens liga `movieId` ↔ `imdbId` ↔ `tmdbId`. O IMDb usa `tconst` (`tt0114709`), construído a partir do `imdbId` com `lpad` a 7 dígitos.
+# MAGIC **Como se ligam as fontes:** todos os títulos do IMDb têm um identificador `tconst` (ex.: `tt0111161`). O ficheiro `links.csv` do MovieLens liga cada filme ao seu `tconst` e ao id do TMDB.
+# MAGIC
+# MAGIC **Ordem de execução:** correr as secções por ordem (1 a 6). Os ficheiros têm de estar no Volume antes da secção 3.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 0. Setup inicial
+# MAGIC ## 1. Setup
 # MAGIC
-# MAGIC A célula seguinte é **sempre a primeira a correr**. Valida e prepara:
-# MAGIC 1. versão do Python e bibliotecas (instala as que faltarem);
-# MAGIC 2. sessão Spark, catálogo, schemas (`bronze`, `silver`, `gold`) e o Volume `raw` dentro da bronze;
-# MAGIC 3. pastas de cada fonte no Volume (cria-as se não existirem) e presença dos ficheiros;
-# MAGIC 4. permissões de escrita (Volume e Delta);
-# MAGIC 5. configurações Spark recomendadas e funções auxiliares que impõem as boas práticas de PySpark.
+# MAGIC - **1.1 Bibliotecas:** imports e versões das ferramentas usadas.
+# MAGIC - **1.2 Variáveis globais:** nome do catálogo e das camadas, caminhos dos ficheiros, schemas e limiares. Ficam todas aqui para que uma alteração (por exemplo, o nome do catálogo) se faça num só sítio.
+# MAGIC - **1.3 Funções auxiliares:** pequenas funções usadas várias vezes ao longo do notebook.
 
 # COMMAND ----------
 
 # ==============================================================================
-# SETUP INICIAL  -  validação de ambiente, criação de caminhos e boas práticas
+# 1.1 BIBLIOTECAS
 # ==============================================================================
-import importlib
-import importlib.metadata as md
-import subprocess
+# No Databricks, o PySpark, o pandas e o matplotlib já vêm instalados.
+# Se faltasse alguma biblioteca, instalava-se numa célula própria com:  %pip install <nome>
 import sys
-import uuid
+from datetime import datetime, timezone
+from importlib.metadata import version
 
+import matplotlib.pyplot as plt
+import pandas as pd
+import pyspark
 from pyspark.sql import functions as F
 
-# ------------------------------- 1. Parâmetros --------------------------------
+print("Python     :", sys.version.split()[0])
+print("PySpark    :", pyspark.__version__)
+print("Spark      :", spark.version)   # a SparkSession 'spark' é criada automaticamente pelo Databricks
+print("pandas     :", pd.__version__)
+print("matplotlib :", version("matplotlib"))
+
+# COMMAND ----------
+
+# ==============================================================================
+# 1.2 VARIÁVEIS GLOBAIS
+# ==============================================================================
+# Widgets: parâmetros que aparecem no topo do notebook e se podem alterar sem mexer no código
 dbutils.widgets.text("catalog", "abd_project", "Catálogo")
-dbutils.widgets.dropdown("auto_install", "sim", ["sim", "nao"], "Instalar libs em falta")
+dbutils.widgets.dropdown("bronze_mode", "append", ["append", "overwrite"], "Escrita na bronze")
 
-CATALOG      = dbutils.widgets.get("catalog").strip()
-AUTO_INSTALL = dbutils.widgets.get("auto_install") == "sim"
+CATALOG     = dbutils.widgets.get("catalog")
+BRONZE_MODE = dbutils.widgets.get("bronze_mode")   # append = cada execução acrescenta um novo lote
+BATCH_ID    = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")   # identifica a leitura desta execução
 
-BRONZE, SILVER, GOLD = "bronze", "silver", "gold"
-LAYERS   = [BRONZE, SILVER, GOLD]
+# ---------------------------- Camadas e caminhos ------------------------------
+BRONZE = "bronze"
+SILVER = "silver"
+GOLD   = "gold"
+LAYERS = [BRONZE, SILVER, GOLD]
+
 VOLUME   = "raw"
-RAW_ROOT = f"/Volumes/{CATALOG}/{BRONZE}/{VOLUME}"  # o Volume vive na camada bronze
-SOURCES  = {s: f"{RAW_ROOT}/{s}" for s in ("tmdb", "imdb", "movielens")}
-
-EXPECTED_FILES = {
-    "tmdb":      ["movie_lists.jsonl", "genres.jsonl", "movie_details.jsonl"],
-    "imdb":      ["title.basics.movies.tsv.gz", "title.ratings.movies.tsv.gz"],
-    "movielens": ["ratings.csv", "movies.csv", "links.csv", "tags.csv"],
+RAW_ROOT = f"/Volumes/{CATALOG}/{BRONZE}/{VOLUME}"   # o Volume com os ficheiros fica na camada bronze
+SOURCES  = {
+    "imdb":      f"{RAW_ROOT}/imdb",
+    "tmdb":      f"{RAW_ROOT}/tmdb",
+    "movielens": f"{RAW_ROOT}/movielens",
 }
-REQUIRED_LIBS = [("pandas", "pandas"), ("matplotlib", "matplotlib")]  # (import, pip)
-MIN_PYTHON    = (3, 9)
 
-# ------------------------- 2. Infraestrutura de validação ---------------------
-results = []  # (verificação, estado, detalhe)
+# ------------------------ Ficheiros de cada fonte -----------------------------
+# tabela bronze -> (ficheiro no Volume, lista de colunas ou schema)
+# IMDb (fonte principal): ficheiros completos, com todos os tipos de título
+IMDB_FILES = {
+    "imdb_title_basics":  ("title.basics.tsv.gz",
+                           ["tconst", "titleType", "primaryTitle", "originalTitle", "isAdult",
+                            "startYear", "endYear", "runtimeMinutes", "genres"]),
+    "imdb_title_ratings": ("title.ratings.tsv.gz",  ["tconst", "averageRating", "numVotes"]),
+    "imdb_title_episode": ("title.episode.tsv.gz",  ["tconst", "parentTconst", "seasonNumber", "episodeNumber"]),
+}
+TMDB_FILES = {
+    "tmdb_movie_lists":   ("movie_lists.jsonl",   "list_name string, page int, payload string"),
+    "tmdb_genres":        ("genres.jsonl",        "payload string"),
+    "tmdb_movie_details": ("movie_details.jsonl", "movie_id long, payload string"),
+}
+MOVIELENS_FILES = {
+    "ml_ratings": ("ratings.csv", ["userId", "movieId", "rating", "timestamp"]),
+    "ml_movies":  ("movies.csv",  ["movieId", "title", "genres"]),
+    "ml_links":   ("links.csv",   ["movieId", "imdbId", "tmdbId"]),
+    "ml_tags":    ("tags.csv",    ["userId", "movieId", "tag", "timestamp"]),
+}
+FILES_BY_SOURCE = {"imdb": IMDB_FILES, "tmdb": TMDB_FILES, "movielens": MOVIELENS_FILES}
 
+# Estrutura do JSON do TMDB (coluna 'payload'), usada para o interpretar
+LIST_MOVIE_SCHEMA = ("id long, title string, original_title string, original_language string, "
+                     "overview string, release_date string, popularity double, "
+                     "vote_average double, vote_count long")
+DETAIL_SCHEMA = ("id long, imdb_id string, title string, original_title string, original_language string, "
+                 "overview string, release_date string, runtime int, budget long, revenue long, "
+                 "status string, popularity double, vote_average double, vote_count long, "
+                 "genres array<struct<id:int,name:string>>")
 
-def run_check(name, fn, critical=True):
-    """Executa uma verificação. Falha => FAIL (crítica) ou WARN (não crítica)."""
-    try:
-        results.append((name, "OK", str(fn() or "")))
-    except Exception as e:
-        results.append((name, "FAIL" if critical else "WARN", f"{type(e).__name__}: {e}"))
+# ------------------------- Tipos de conteúdo do IMDb ---------------------------
+# Só entram na análise filmes e séries (ficam de fora episódios, curtas, jogos, vídeos...)
+MOVIE_TYPES  = ["movie", "tvMovie"]
+SERIES_TYPES = ["tvSeries", "tvMiniSeries"]
 
+# --------------------------------- Limiares -----------------------------------
+MAX_BAD_KEYS_PCT    = 0.1    # % máxima de chaves nulas/inválidas; acima disto a silver não é carregada
+MAX_BAD_FEATURE_PCT = 5.0    # % de valores inválidos numa feature a partir da qual se mostra um aviso
+MIN_IMDB_VOTES      = 1000   # um título só entra na análise se tiver votos suficientes ("fiável")
+TOP_MIN_VOTES       = 25000  # peso dos votos na nota ponderada do ranking (ver secção 4.6)
+MIN_TITLES_PER_GROUP = 30    # mínimo de títulos por grupo nas tabelas agregadas
 
-# --------------------------- 3. Python e bibliotecas --------------------------
-def check_python():
-    v = sys.version_info
-    if (v.major, v.minor) < MIN_PYTHON:
-        raise RuntimeError(f"Python {v.major}.{v.minor} < {MIN_PYTHON[0]}.{MIN_PYTHON[1]}")
-    return f"Python {v.major}.{v.minor}.{v.micro}"
-
-
-def check_pyspark():
-    import pyspark
-    return f"pyspark {pyspark.__version__}"
-
-
-def make_lib_check(import_name, pip_name):
-    def _check():
-        try:
-            version = md.version(pip_name)
-        except md.PackageNotFoundError:
-            if not AUTO_INSTALL:
-                raise RuntimeError(f"'{pip_name}' não está instalada (auto_install = nao)")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name])
-            importlib.invalidate_caches()
-            version = f"{md.version(pip_name)} (instalada agora)"
-        importlib.import_module(import_name)
-        return f"{pip_name} {version}"
-    return _check
-
-
-run_check("Python", check_python)
-run_check("Biblioteca: pyspark", check_pyspark)
-for _imp, _pip in REQUIRED_LIBS:
-    run_check(f"Biblioteca: {_pip}", make_lib_check(_imp, _pip))
-
-
-# ----------------- 4. Spark, catálogo, schemas, volume e pastas ---------------
-def check_spark():
-    if spark.range(5).count() != 5:
-        raise RuntimeError("A sessão Spark devolveu um resultado inesperado")
-    return f"Spark {spark.version}"
-
-
-def check_catalog():
-    catalogs = [r[0] for r in spark.sql("SHOW CATALOGS").collect()]
-    if CATALOG not in catalogs:
-        raise RuntimeError(f"Catálogo '{CATALOG}' não existe. Disponíveis: {catalogs}")
-    return f"Catálogo '{CATALOG}' encontrado"
-
-
-def ensure_schema(schema):
-    def _ensure():
-        existed = spark.sql(f"SHOW SCHEMAS IN {CATALOG} LIKE '{schema}'").count() > 0
-        if not existed:
-            spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{schema}")
-        return f"{CATALOG}.{schema} " + ("já existia" if existed else "criado")
-    return _ensure
-
-
-def ensure_volume():
-    existed = spark.sql(f"SHOW VOLUMES IN {CATALOG}.{BRONZE} LIKE '{VOLUME}'").count() > 0
-    if not existed:
-        spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{BRONZE}.{VOLUME}")
-    return f"{RAW_ROOT} " + ("já existia" if existed else "criado")
-
-
-def ensure_folder(path):
-    def _ensure():
-        try:
-            dbutils.fs.ls(path)
-            return f"já existia: {path}"
-        except Exception:
-            dbutils.fs.mkdirs(path)
-            dbutils.fs.ls(path)  # confirma que ficou criada
-            return f"criada: {path}"
-    return _ensure
-
-
-def check_source_files(source):
-    def _check():
-        present = {f.name for f in dbutils.fs.ls(SOURCES[source])}
-        missing = [n for n in EXPECTED_FILES[source] if n not in present]
-        if missing:
-            raise RuntimeError(f"faltam {missing} em {SOURCES[source]}")
-        return f"{len(EXPECTED_FILES[source])} ficheiros presentes"
-    return _check
-
-
-def check_volume_write():
-    path = f"{RAW_ROOT}/_setup_check_{uuid.uuid4().hex[:8]}.tmp"
-    dbutils.fs.put(path, "ok", True)
-    try:
-        content = dbutils.fs.head(path)
-    finally:
-        dbutils.fs.rm(path)
-    if content != "ok":
-        raise RuntimeError("Leitura do ficheiro de teste não coincide com o escrito")
-    return "Escrita, leitura e remoção no Volume OK"
-
-
-def check_delta_write():
-    table = f"{CATALOG}.{BRONZE}._setup_check_{uuid.uuid4().hex[:8]}"
-    try:
-        spark.range(3).write.format("delta").saveAsTable(table)
-        n = spark.table(table).count()
-    finally:
-        spark.sql(f"DROP TABLE IF EXISTS {table}")
-    if n != 3:
-        raise RuntimeError(f"Esperadas 3 linhas, lidas {n}")
-    return "Criação, leitura e remoção de tabela Delta OK"
-
-
-run_check("Sessão Spark", check_spark)
-run_check("Catálogo", check_catalog)
-for _schema in LAYERS:
-    run_check(f"Schema {_schema}", ensure_schema(_schema))
-run_check("Volume (bronze.raw)", ensure_volume)
-for _source, _path in SOURCES.items():
-    run_check(f"Pasta {_source}", ensure_folder(_path))
-run_check("Escrita no Volume", check_volume_write)
-run_check("Escrita Delta", check_delta_write)
-for _source in SOURCES:  # informativo: antes do upload é normal faltarem
-    run_check(f"Ficheiros {_source}", check_source_files(_source), critical=False)
-
-# ------------------- 5. Configurações Spark recomendadas ----------------------
-# No serverless (Free Edition) muitas configurações são geridas pelo ambiente;
-# tenta-se aplicar e regista-se o que ficou efetivo.
+# ---------------------------- Configurações Spark -----------------------------
+# Na Free Edition (serverless) algumas configurações são geridas pelo Databricks e não se
+# podem alterar; por isso tenta-se aplicar cada uma e mostra-se o resultado.
 SPARK_CONFS = {
     "spark.sql.session.timeZone": "UTC",
-    "spark.sql.adaptive.enabled": "true",                     # Adaptive Query Execution
-    "spark.sql.adaptive.coalescePartitions.enabled": "true",  # junta partições pequenas
-    "spark.sql.adaptive.skewJoin.enabled": "true",            # trata skew em joins
-    "spark.sql.autoBroadcastJoinThreshold": "10485760",       # 10 MB
-    "spark.databricks.delta.optimizeWrite.enabled": "true",
-    "spark.databricks.delta.autoCompact.enabled": "true",
+    "spark.sql.adaptive.enabled": "true",                # Adaptive Query Execution (AQE)
+    "spark.sql.autoBroadcastJoinThreshold": "10485760",  # tabelas até 10 MB são enviadas a todos os nós
 }
-conf_report = []
-for _key, _wanted in SPARK_CONFS.items():
+for conf_name, conf_value in SPARK_CONFS.items():
     try:
-        spark.conf.set(_key, _wanted)
-        _status = "aplicada"
+        spark.conf.set(conf_name, conf_value)
+        print(f"[aplicada]                {conf_name} = {conf_value}")
     except Exception:
-        _status = "gerida pelo ambiente"
-    try:
-        _current = spark.conf.get(_key)
-    except Exception:
-        _current = "n/d"
-    conf_report.append((_key, _wanted, str(_current), _status))
-_applied = sum(r[3] == "aplicada" for r in conf_report)
-results.append(("Configurações Spark", "OK",
-                f"{_applied} aplicadas, {len(conf_report) - _applied} geridas pelo ambiente"))
+        print(f"[gerida pelo Databricks]  {conf_name}")
 
+print(f"\nCatálogo: {CATALOG} | Volume: {RAW_ROOT} | Lote: {BATCH_ID} | Bronze em modo: {BRONZE_MODE}")
 
-# --------------- 6. Funções auxiliares (impõem as boas práticas) --------------
+# COMMAND ----------
+
+# ==============================================================================
+# 1.3 FUNÇÕES AUXILIARES
+# ==============================================================================
 def tbl(layer, name):
-    """Nome totalmente qualificado: catálogo.camada.tabela."""
+    """Nome completo de uma tabela no Unity Catalog: catálogo.camada.tabela"""
     return f"{CATALOG}.{layer}.{name}"
 
 
-def read_raw_csv(path, columns, sep=",", quote='"', escape="\\", multiline=False):
-    """Leitura bronze: schema EXPLÍCITO (sem inferSchema), tudo em string, fiel à origem."""
+def missing_files(source):
+    """Lista os ficheiros esperados de uma fonte que ainda não estão no Volume."""
+    present = [f.name for f in dbutils.fs.ls(SOURCES[source])]
+    expected = [file_name for file_name, _ in FILES_BY_SOURCE[source].values()]
+    return [file_name for file_name in expected if file_name not in present]
+
+
+def read_csv_as_strings(path, columns, sep=",", quote='"', escape="\\", multiline=False):
+    """Lê um CSV/TSV com schema explícito e todas as colunas como texto (string).
+    Na bronze não se convertem tipos: guarda-se o dado exatamente como veio da fonte."""
     schema = ", ".join(f"`{c}` string" for c in columns)
-    return (spark.read.schema(schema)
-            .option("header", True).option("sep", sep).option("quote", quote)
-            .option("escape", escape).option("multiLine", multiline)
-            .option("mode", "PERMISSIVE")
+    return (spark.read
+            .schema(schema)
+            .option("header", True)
+            .option("sep", sep)
+            .option("quote", quote)
+            .option("escape", escape)
+            .option("multiLine", multiline)
             .csv(path))
 
 
-def with_audit(df, source):
-    """Metadados de auditoria da bronze: fonte, ficheiro de origem e momento da ingestão."""
-    return (df.withColumn("_source", F.lit(source))
-              .withColumn("_source_file", F.col("_metadata.file_path"))
-              .withColumn("_ingested_at", F.current_timestamp()))
+def add_audit_columns(df, source):
+    """Acrescenta colunas de auditoria: fonte, ficheiro de origem, lote e data da leitura."""
+    return (df
+            .withColumn("_source", F.lit(source))
+            .withColumn("_source_file", F.col("_metadata.file_path"))
+            .withColumn("_batch_id", F.lit(BATCH_ID))
+            .withColumn("_ingested_at", F.current_timestamp()))
 
 
-def nullify(df, tokens=("\\N",), cols=None):
-    """Converte tokens de 'em falta' (ex.: \\N do IMDb) em null, num único select (sem withColumn em ciclo)."""
-    target = set(cols or [c for c, t in df.dtypes if t == "string"])
-    return df.select(*[
-        F.when(F.col(c).isin(*tokens), F.lit(None)).otherwise(F.col(c)).alias(c) if c in target else F.col(c)
-        for c in df.columns
-    ])
+def read_bronze(table_name):
+    """Lê o lote mais recente de uma tabela bronze (a bronze guarda todas as leituras)."""
+    df = spark.table(tbl(BRONZE, table_name))
+    last_batch = df.agg(F.max("_batch_id")).first()[0]
+    return df.where(F.col("_batch_id") == last_batch)
 
 
-def try_cast(col_name, dtype):
-    """Cast tolerante: valores inválidos tornam-se null em vez de rebentar (ANSI mode)."""
-    return F.expr(f"try_cast(`{col_name}` AS {dtype})")
+def try_cast(column, data_type):
+    """Converte o tipo de uma coluna; se o valor for inválido devolve null em vez de dar erro."""
+    return F.expr(f"try_cast(`{column}` AS {data_type})")
 
 
-def safe_date(col_name):
-    """Converte 'yyyy-MM-dd' em data; qualquer outro valor (vazio, inválido) fica null."""
-    return F.when(F.col(col_name).rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(F.col(col_name)))
+def to_date_safe(column):
+    """Converte texto 'aaaa-mm-dd' em data; qualquer outro valor (vazio, inválido) fica null."""
+    return F.when(F.col(column).rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(F.col(column)))
 
 
-def write_delta(df, layer, name, cluster_by=None, comment=None, mode="overwrite"):
-    """Escreve uma tabela Delta gerida (Unity Catalog), opcionalmente com Liquid Clustering,
-    e devolve o DataFrame lido da tabela (as camadas seguintes partem do que ficou guardado)."""
-    full = tbl(layer, name)
-    if cluster_by:
-        view = f"_w_{uuid.uuid4().hex[:8]}"
-        df.createOrReplaceTempView(view)
-        spark.sql(f"CREATE OR REPLACE TABLE {full} CLUSTER BY ({', '.join(cluster_by)}) "
-                  f"AS SELECT * FROM {view}")
-    else:
+def save_table(df, layer, name, comment, mode="overwrite", cluster_by=None):
+    """Grava um DataFrame como tabela Delta no Unity Catalog e devolve a tabela gravada.
+    cluster_by: colunas de Liquid Clustering (organiza os ficheiros para filtrar mais depressa)."""
+    full_name = tbl(layer, name)
+    if cluster_by is None:
         writer = df.write.format("delta").mode(mode)
         if mode == "overwrite":
             writer = writer.option("overwriteSchema", "true")
-        writer.saveAsTable(full)
-    if comment:
-        spark.sql(f"COMMENT ON TABLE {full} IS '{comment.replace(chr(39), chr(39) * 2)}'")
-    out = spark.table(full)
-    print(f"[{layer}] {full}: {out.count():,} linhas")
-    return out
+        else:
+            writer = writer.option("mergeSchema", "true")
+        writer.saveAsTable(full_name)
+    else:
+        # O Liquid Clustering define-se em SQL: cria-se uma vista temporária e a tabela a partir dela
+        df.createOrReplaceTempView("tmp_to_save")
+        spark.sql(f"""CREATE OR REPLACE TABLE {full_name}
+                      CLUSTER BY ({", ".join(cluster_by)})
+                      AS SELECT * FROM tmp_to_save""")
+    spark.sql(f"COMMENT ON TABLE {full_name} IS '{comment.replace(chr(39), '')}'")
+    saved = spark.table(full_name)
+    print(f"[{layer}] {full_name}: {saved.count():,} linhas")
+    return saved
 
 
-def assert_unique(df, key, label):
-    """Controlo de qualidade: a chave tem de ser única (uma só ação Spark)."""
-    total, distinct = df.agg(F.count("*"), F.countDistinct(key)).first()
+def check_unique(df, key, label):
+    """Controlo de qualidade: a chave não pode ter valores repetidos."""
+    total = df.count()
+    distinct = df.select(key).distinct().count()
     if total != distinct:
-        raise ValueError(f"{label}: chave '{key}' duplicada ({total:,} linhas, {distinct:,} distintas)")
-    print(f"[qualidade] {label}: '{key}' única ({total:,} linhas)")
+        raise ValueError(f"{label}: a chave '{key}' tem duplicados ({total:,} linhas, {distinct:,} distintas)")
+    print(f"[qualidade] {label}: chave '{key}' única ({total:,} linhas)")
 
 
-def require_files(source):
-    """Falha cedo, com mensagem clara, se faltarem ficheiros da fonte no Volume."""
-    present = {f.name for f in dbutils.fs.ls(SOURCES[source])}
-    missing = [n for n in EXPECTED_FILES[source] if n not in present]
-    if missing:
-        raise FileNotFoundError(f"Faltam {missing} em {SOURCES[source]}. Carrega-os (Catalog > Upload to this volume).")
-
-
-# ----------------------------- 7. Resumo e checklist --------------------------
-display(spark.createDataFrame(results, "verificacao string, estado string, detalhe string"))
-display(spark.createDataFrame(conf_report, "configuracao string, pretendido string, atual string, estado string"))
-
-BEST_PRACTICES = [
-    "Schemas explícitos nas leituras (sem inferSchema); bronze em string, tipagem só na silver",
-    "Conversões com try_cast: valores inválidos viram null em vez de rebentar o job",
-    "Transformações num único select (sem withColumn em ciclo) e funções nativas (sem UDFs)",
-    "Joins: dimensões pequenas com broadcast; filtros e colunas escolhidas o mais cedo possível",
-    "Sem collect()/toPandas() em dados grandes; só em tabelas gold já agregadas",
-    "Sem cache()/RDDs (não suportados no serverless); cada camada lê a tabela Delta da anterior",
-    "Escritas em Delta com overwrite idempotente, comentário na tabela e Liquid Clustering",
-    "Controlos de qualidade explícitos (unicidade de chaves, contagens por camada)",
-    "Schemas separados por camada (bronze com o Volume de ficheiros brutos, silver, gold) no Unity Catalog",
-]
-print("\nBoas práticas aplicadas neste notebook:")
-for _bp in BEST_PRACTICES:
-    print(f"  - {_bp}")
-
-_fails = [r for r in results if r[1] == "FAIL"]
-_warns = [r for r in results if r[1] == "WARN"]
-print(f"\nOK: {sum(r[1] == 'OK' for r in results)} | WARN: {len(_warns)} | FAIL: {len(_fails)}")
-for _name, _, _detail in _warns:
-    print(f"  [WARN] {_name}: {_detail}")
-if _fails:
-    for _name, _, _detail in _fails:
-        print(f"  [FAIL] {_name}: {_detail}")
-    raise RuntimeError(f"Setup inválido: {len(_fails)} verificação(ões) crítica(s) falharam.")
-print("\nSetup válido. Se houver WARN de ficheiros, carrega-os para o Volume antes das pipelines.")
+print("Funções auxiliares carregadas.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Pipeline TMDB (JSON)
+# MAGIC ## 2. Preparação do ambiente
 # MAGIC
-# MAGIC **Bronze:** os três ficheiros `.jsonl` guardados tal como vieram (o filme completo continua em JSON dentro de `payload`, a componente não estruturada).
-# MAGIC **Silver:** o JSON é interpretado com schema explícito, tipado e deduplicado; os géneros ficam numa tabela própria.
+# MAGIC Cria (se ainda não existirem) o catálogo, os três schemas da arquitetura Medallion (`bronze`, `silver`, `gold`), o Volume `raw` e uma pasta por fonte. Todos os comandos usam `IF NOT EXISTS`, por isso a célula pode ser corrida várias vezes sem erros.
+# MAGIC
+# MAGIC No fim mostra que ficheiros já estão no Volume. Na primeira execução é normal faltarem: carregam-se em **Catalog > abd_project > bronze > raw > Upload to this volume**.
 
 # COMMAND ----------
 
-# =========================== PIPELINE 1/3 · TMDB ===========================
-SRC = SOURCES["tmdb"]
-require_files("tmdb")
+# ==============================================================================
+# 2. PREPARAÇÃO DO AMBIENTE  -  catálogo, schemas, Volume, pastas e ficheiros
+# ==============================================================================
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
+for layer in LAYERS:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{layer}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{BRONZE}.{VOLUME}")
+for folder in SOURCES.values():
+    dbutils.fs.mkdirs(folder)   # não faz nada se a pasta já existir
 
-# ------------------------------- BRONZE --------------------------------------
-lists_raw = spark.read.schema("list_name string, page int, payload string").json(f"{SRC}/movie_lists.jsonl")
-write_delta(with_audit(lists_raw, "tmdb"), BRONZE, "tmdb_movie_lists",
-            comment="TMDB: filmes das listas popular/top_rated/now_playing (JSON bruto)")
+display(spark.sql(f"SHOW SCHEMAS IN {CATALOG}"))
 
-genres_raw = spark.read.schema("payload string").json(f"{SRC}/genres.jsonl")
-write_delta(with_audit(genres_raw, "tmdb"), BRONZE, "tmdb_genres",
-            comment="TMDB: lista de géneros (JSON bruto)")
+# Que ficheiros já estão no Volume?
+file_status = []
+for source in SOURCES:
+    present = [f.name for f in dbutils.fs.ls(SOURCES[source])]
+    for file_name, _ in FILES_BY_SOURCE[source].values():
+        status = "OK" if file_name in present else "EM FALTA"
+        file_status.append((source, file_name, status))
 
-details_raw = spark.read.schema("movie_id long, payload string").json(f"{SRC}/movie_details.jsonl")
-write_delta(with_audit(details_raw, "tmdb"), BRONZE, "tmdb_movie_details",
-            comment="TMDB: detalhe por filme (JSON bruto)")
+display(spark.createDataFrame(file_status, "fonte string, ficheiro string, estado string"))
 
-# ------------------------------- SILVER --------------------------------------
-LIST_MOVIE_DDL = ("id long, title string, original_title string, original_language string, overview string, "
-                  "release_date string, popularity double, vote_average double, vote_count long")
-
-tmdb_movies = (
-    spark.table(tbl(BRONZE, "tmdb_movie_lists"))
-    .select("list_name", F.from_json("payload", LIST_MOVIE_DDL).alias("m"))
-    .select("list_name", F.col("m.id").alias("tmdb_id"), "m.title", "m.original_title", "m.original_language",
-            "m.overview", F.col("m.release_date").alias("release_date_raw"),
-            "m.popularity", "m.vote_average", "m.vote_count")
-    .select("list_name", "tmdb_id", "title", "original_title", "original_language", "overview",
-            F.when(F.col("release_date_raw").rlike(r"^\d{4}-\d{2}-\d{2}$"),
-                   F.to_date("release_date_raw")).alias("release_date"),
-            "popularity", "vote_average", "vote_count")
-    .groupBy("tmdb_id")
-    .agg(F.first("title").alias("title"),
-         F.first("original_title").alias("original_title"),
-         F.first("original_language").alias("original_language"),
-         F.first("overview").alias("overview"),
-         F.first("release_date").alias("release_date"),
-         F.max("popularity").alias("popularity"),
-         F.max("vote_average").alias("vote_average"),
-         F.max("vote_count").alias("vote_count"),
-         F.collect_set("list_name").alias("lists"))
-    .withColumn("release_year", F.year("release_date"))
-)
-assert_unique(tmdb_movies, "tmdb_id", "silver.tmdb_movies")
-write_delta(tmdb_movies, SILVER, "tmdb_movies",
-            comment="TMDB: filmes das listas, um por tmdb_id, com as listas em que aparecem")
-
-DETAIL_DDL = ("id long, imdb_id string, title string, original_title string, original_language string, "
-              "overview string, release_date string, runtime int, budget long, revenue long, status string, "
-              "popularity double, vote_average double, vote_count long, "
-              "genres array<struct<id:int,name:string>>")
-
-details_parsed = (
-    spark.table(tbl(BRONZE, "tmdb_movie_details"))
-    .select(F.from_json("payload", DETAIL_DDL).alias("d"))
-    .select("d.*")
-)
-tmdb_details = (
-    nullify(details_parsed, tokens=("",))
-    .select(F.col("id").alias("tmdb_id"), "imdb_id", "title", "original_title", "original_language", "overview",
-            safe_date("release_date").alias("release_date"),
-            F.col("runtime").alias("runtime_minutes"), "budget", "revenue", "status",
-            "popularity", "vote_average", "vote_count", "genres")
-    .dropDuplicates(["tmdb_id"])
-)
-assert_unique(tmdb_details, "tmdb_id", "silver.tmdb_movie_details")
-tmdb_details = write_delta(tmdb_details, SILVER, "tmdb_movie_details",
-                           comment="TMDB: detalhe tipado (orçamento, receita, duração, géneros)")
-
-tmdb_movie_genres = (tmdb_details
-                     .select("tmdb_id", F.explode("genres").alias("g"))
-                     .select("tmdb_id", F.col("g.id").alias("genre_id"), F.col("g.name").alias("genre_name")))
-write_delta(tmdb_movie_genres, SILVER, "tmdb_movie_genres",
-            comment="TMDB: relação filme-género (nomes no idioma pedido ao descarregar)")
+n_missing = len([row for row in file_status if row[2] == "EM FALTA"])
+if n_missing > 0:
+    print(f"Faltam {n_missing} ficheiro(s): carrega-os para o Volume antes da secção 3.")
+else:
+    print("Ambiente pronto: todos os ficheiros estão no Volume.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Pipeline IMDb (TSV)
+# MAGIC ## 3. Ingestão na camada Bronze (IMDb, TMDB, MovieLens)
 # MAGIC
-# MAGIC **Bronze:** `title.basics` e `title.ratings` (já filtrados para `titleType = movie` no download), tudo em string, com `\N` preservado.
-# MAGIC **Silver:** `\N` passa a `null`, colunas tipadas, adultos removidos, géneros em array e nota/votos juntos ao filme. Tabela com **Liquid Clustering** por `start_year`.
+# MAGIC Cada ficheiro é lido do Volume com **schema explícito** e gravado **tal como veio**, mais quatro colunas de auditoria: `_source`, `_source_file`, `_batch_id` e `_ingested_at`. Não se usa `inferSchema`, porque obriga o Spark a ler os dados duas vezes e pode adivinhar mal os tipos.
+# MAGIC
+# MAGIC A escrita é em modo **append**: cada execução acrescenta um novo lote, por isso a bronze guarda o **histórico de todas as leituras** e é possível reprocessar a silver a partir de qualquer lote. As camadas seguintes usam sempre o lote mais recente (função `read_bronze`). Para começar do zero, muda o widget `bronze_mode` para `overwrite`.
+# MAGIC
+# MAGIC O IMDb é o maior volume de dados do projeto: só o `title.basics` tem mais de 10 milhões de títulos e o `title.episode` cerca de 9 milhões de episódios.
 
 # COMMAND ----------
 
-# ============================ PIPELINE 2/3 · IMDb ============================
-SRC = SOURCES["imdb"]
-require_files("imdb")
+# =========================== 3.1 BRONZE · IMDb (TSV) ==========================
+# Os ficheiros do IMDb são separados por tabulação (\t) e não usam aspas; valores em falta vêm como \N.
+# Têm todos os tipos de título (filmes, séries, episódios...): na bronze guarda-se tudo.
+if missing_files("imdb"):
+    raise FileNotFoundError(f"Faltam ficheiros do IMDb: {missing_files('imdb')}")
 
-BASICS_COLS  = ["tconst", "titleType", "primaryTitle", "originalTitle", "isAdult",
-                "startYear", "endYear", "runtimeMinutes", "genres"]
-RATINGS_COLS = ["tconst", "averageRating", "numVotes"]
+for table_name, (file_name, columns) in IMDB_FILES.items():
+    df_raw = read_csv_as_strings(f"{SOURCES['imdb']}/{file_name}", columns, sep="\t", quote="")
+    save_table(add_audit_columns(df_raw, "imdb"), BRONZE, table_name, mode=BRONZE_MODE,
+               comment=f"IMDb {file_name}, valores em texto")
 
-# ------------------------------- BRONZE --------------------------------------
-# TSV do IMDb: separador tab e sem aspas (os títulos podem conter aspas).
-basics_raw  = read_raw_csv(f"{SRC}/title.basics.tsv.gz",  BASICS_COLS,  sep="\t", quote="")
-ratings_raw = read_raw_csv(f"{SRC}/title.ratings.tsv.gz", RATINGS_COLS, sep="\t", quote="")
+# COMMAND ----------
 
-write_delta(with_audit(basics_raw, "imdb"), BRONZE, "imdb_title_basics",
-            comment="IMDb title.basics (só filmes), valores brutos em string")
-write_delta(with_audit(ratings_raw, "imdb"), BRONZE, "imdb_title_ratings",
-            comment="IMDb title.ratings (só filmes), valores brutos em string")
+# =========================== 3.2 BRONZE · TMDB (JSON) =========================
+# Alternativa: o notebook tmdb_bronze_dynamic.py cria estas mesmas tabelas a partir da API do TMDB.
+if missing_files("tmdb"):
+    raise FileNotFoundError(f"Faltam ficheiros do TMDB: {missing_files('tmdb')}")
 
-# ------------------------------- SILVER --------------------------------------
-basics  = nullify(spark.table(tbl(BRONZE, "imdb_title_basics")))
-ratings = nullify(spark.table(tbl(BRONZE, "imdb_title_ratings")))
+for table_name, (file_name, schema) in TMDB_FILES.items():
+    df_raw = spark.read.schema(schema).json(f"{SOURCES['tmdb']}/{file_name}")
+    save_table(add_audit_columns(df_raw, "tmdb"), BRONZE, table_name, mode=BRONZE_MODE,
+               comment=f"TMDB {file_name}: JSON bruto, um lote por leitura")
 
-imdb_ratings = ratings.select("tconst",
-                              try_cast("averageRating", "double").alias("imdb_rating"),
-                              try_cast("numVotes", "bigint").alias("imdb_votes"))
+# COMMAND ----------
 
-imdb_movies = (
-    basics.where(F.col("titleType") == "movie")
-    .select("tconst",
-            F.col("primaryTitle").alias("title"),
-            F.col("originalTitle").alias("original_title"),
-            (F.col("isAdult") == "1").alias("is_adult"),
-            try_cast("startYear", "int").alias("start_year"),
-            try_cast("runtimeMinutes", "int").alias("runtime_minutes"),
-            F.split("genres", ",").alias("genres"))
-    .where(~F.coalesce(F.col("is_adult"), F.lit(False)))
-    .dropDuplicates(["tconst"])
-    .join(imdb_ratings, "tconst", "left")
-)
-assert_unique(imdb_movies, "tconst", "silver.imdb_movies")
-imdb_movies = write_delta(imdb_movies, SILVER, "imdb_movies", cluster_by=["start_year"],
-                          comment="IMDb: filmes não adultos, tipados, com nota e votos (Liquid Clustering por start_year)")
+# ========================= 3.3 BRONZE · MovieLens (CSV) =======================
+# Títulos e tags podem ter vírgulas e aspas, por isso usa-se escape='"' e multiLine.
+if missing_files("movielens"):
+    raise FileNotFoundError(f"Faltam ficheiros do MovieLens: {missing_files('movielens')}")
 
-imdb_movie_genres = imdb_movies.select("tconst", F.explode("genres").alias("genre"))
-write_delta(imdb_movie_genres, SILVER, "imdb_movie_genres",
-            comment="IMDb: relação filme-género (nomes em inglês)")
+for table_name, (file_name, columns) in MOVIELENS_FILES.items():
+    df_raw = read_csv_as_strings(f"{SOURCES['movielens']}/{file_name}", columns,
+                                 escape='"', multiline=(table_name != "ml_ratings"))
+    save_table(add_audit_columns(df_raw, "movielens"), BRONZE, table_name, mode=BRONZE_MODE,
+               comment=f"MovieLens {file_name}, valores em texto")
+
+# COMMAND ----------
+
+# ====================== 3.4 BRONZE · histórico de leituras =====================
+# Uma linha por tabela e por lote: mostra que a bronze guarda todas as leituras feitas.
+all_bronze_tables = list(IMDB_FILES) + list(TMDB_FILES) + list(MOVIELENS_FILES)
+
+batches_per_table = []
+for table_name in all_bronze_tables:
+    batches = (spark.table(tbl(BRONZE, table_name))
+               .groupBy("_batch_id")
+               .agg(F.count("*").alias("linhas"), F.max("_ingested_at").alias("lido_em"))
+               .withColumn("tabela", F.lit(table_name)))
+    batches_per_table.append(batches)
+
+# Junta as tabelas de resumo numa só (union = empilhar linhas)
+history = batches_per_table[0]
+for batches in batches_per_table[1:]:
+    history = history.unionByName(batches)
+
+display(history.select("tabela", "_batch_id", "linhas", "lido_em").orderBy("tabela", F.desc("_batch_id")))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Pipeline MovieLens (CSV)
+# MAGIC ## 4. Camada Silver e datamart de negócio
 # MAGIC
-# MAGIC **Bronze:** `ratings`, `movies`, `links` e `tags` como vieram (CSV com aspas duplicadas, daí `escape='"'`).
-# MAGIC **Silver:** avaliações com timestamp real, título separado do ano, géneros em array, `tconst` construído a partir do `imdbId` e tags normalizadas (texto livre).
+# MAGIC ### 4.1 Identificação e validação das features
+# MAGIC
+# MAGIC Antes de carregar a silver identifica-se o **papel** de cada variável e verifica-se a qualidade do lote mais recente da bronze:
+# MAGIC
+# MAGIC | Papel | Significado | O que acontece se houver problemas |
+# MAGIC |---|---|---|
+# MAGIC | `chave` | identifica cada linha (ex.: `tconst`, `movieId`) | acima de `MAX_BAD_KEYS_PCT` a pipeline **para** |
+# MAGIC | `ligacao` | liga uma tabela a outra (ex.: `parentTconst`, `imdbId`) | aviso acima de `MAX_BAD_FEATURE_PCT` |
+# MAGIC | `feature` | variável usada na análise (nota, votos, ano, duração...) | aviso acima de `MAX_BAD_FEATURE_PCT` |
+# MAGIC | `texto` | títulos, sinopses, tags (dados não estruturados) | só se contam os nulos |
+# MAGIC
+# MAGIC Para cada coluna contam-se três coisas: valores **nulos**, valores **inválidos** (não convertem para o tipo certo ou não seguem o formato esperado) e valores **fora do intervalo** (ex.: uma nota acima de 10). O relatório fica guardado em `silver.dq_feature_report`.
+# MAGIC
+# MAGIC _Nota (aula #04):_ os DataFrames de `DATA_TO_VALIDATE` são só **transformações**, por isso o Spark ainda não leu nada (**lazy evaluation**). Os dados só são lidos quando a função `validate_table` executa a **ação** `.first()`.
 
 # COMMAND ----------
 
-# ========================= PIPELINE 3/3 · MovieLens ==========================
-SRC = SOURCES["movielens"]
-require_files("movielens")
-
-# ------------------------------- BRONZE --------------------------------------
-ML_SCHEMAS = {
-    "ratings": ["userId", "movieId", "rating", "timestamp"],
-    "movies":  ["movieId", "title", "genres"],
-    "links":   ["movieId", "imdbId", "tmdbId"],
-    "tags":    ["userId", "movieId", "tag", "timestamp"],
+# ================= 4.1 IDENTIFICAÇÃO E VALIDAÇÃO DAS FEATURES ==================
+# Regras por tabela: coluna, tipo esperado, papel e, opcionalmente, formato (regex) e intervalo [min, max]
+FEATURE_RULES = {
+    "imdb_title_basics": [
+        {"col": "tconst",         "type": "string", "role": "chave",   "regex": r"^tt\d{7,}$"},
+        {"col": "titleType",      "type": "string", "role": "feature"},
+        {"col": "primaryTitle",   "type": "string", "role": "texto"},
+        {"col": "isAdult",        "type": "int",    "role": "feature", "regex": r"^[01]$"},
+        {"col": "startYear",      "type": "int",    "role": "feature", "min": 1870, "max": 2035},
+        {"col": "endYear",        "type": "int",    "role": "feature", "min": 1870, "max": 2035},
+        {"col": "runtimeMinutes", "type": "int",    "role": "feature", "min": 0},
+        {"col": "genres",         "type": "string", "role": "feature"},
+    ],
+    "imdb_title_ratings": [
+        {"col": "tconst",        "type": "string", "role": "chave",   "regex": r"^tt\d{7,}$"},
+        {"col": "averageRating", "type": "double", "role": "feature", "min": 1, "max": 10},
+        {"col": "numVotes",      "type": "bigint", "role": "feature", "min": 0},
+    ],
+    "imdb_title_episode": [
+        {"col": "tconst",        "type": "string", "role": "chave",   "regex": r"^tt\d{7,}$"},
+        {"col": "parentTconst",  "type": "string", "role": "ligacao", "regex": r"^tt\d{7,}$"},
+        {"col": "seasonNumber",  "type": "int",    "role": "feature", "min": 0, "max": 1000},
+        {"col": "episodeNumber", "type": "int",    "role": "feature", "min": 0},
+    ],
+    "tmdb_movie_details": [
+        {"col": "id",                "type": "bigint", "role": "chave",   "min": 1},
+        {"col": "imdb_id",           "type": "string", "role": "ligacao", "regex": r"^tt\d{7,}$"},
+        {"col": "overview",          "type": "string", "role": "texto"},
+        {"col": "original_language", "type": "string", "role": "feature", "regex": r"^[a-z]{2}$"},
+        {"col": "budget",            "type": "bigint", "role": "feature", "min": 0},
+        {"col": "revenue",           "type": "bigint", "role": "feature", "min": 0},
+        {"col": "vote_average",      "type": "double", "role": "feature", "min": 0, "max": 10},
+    ],
+    "ml_ratings": [
+        {"col": "userId",    "type": "int",    "role": "chave",   "min": 1},
+        {"col": "movieId",   "type": "int",    "role": "chave",   "min": 1},
+        {"col": "rating",    "type": "double", "role": "feature", "min": 0.5, "max": 5},
+        {"col": "timestamp", "type": "bigint", "role": "feature", "min": 0},
+    ],
+    "ml_links": [
+        {"col": "movieId", "type": "int",    "role": "chave",   "min": 1},
+        {"col": "imdbId",  "type": "string", "role": "ligacao", "regex": r"^\d+$"},
+        {"col": "tmdbId",  "type": "int",    "role": "ligacao", "min": 1},
+    ],
+    "ml_tags": [
+        {"col": "userId",  "type": "int",    "role": "chave", "min": 1},
+        {"col": "movieId", "type": "int",    "role": "chave", "min": 1},
+        {"col": "tag",     "type": "string", "role": "texto"},
+    ],
 }
-for name, cols in ML_SCHEMAS.items():
-    raw = read_raw_csv(f"{SRC}/{name}.csv", cols, escape='"', multiline=(name != "ratings"))
-    write_delta(with_audit(raw, "movielens"), BRONZE, f"ml_{name}",
-                comment=f"MovieLens {name}.csv, valores brutos em string")
 
-# ------------------------------- SILVER --------------------------------------
-ml_ratings = (
-    spark.table(tbl(BRONZE, "ml_ratings"))
-    .select(try_cast("userId", "int").alias("user_id"),
-            try_cast("movieId", "int").alias("movie_id"),
-            try_cast("rating", "double").alias("rating"),
-            F.timestamp_seconds(try_cast("timestamp", "bigint")).alias("rated_at"))
-    .where(F.col("movie_id").isNotNull() & F.col("rating").isNotNull())
-    .dropDuplicates(["user_id", "movie_id", "rated_at"])
-)
-write_delta(ml_ratings, SILVER, "ml_ratings", cluster_by=["movie_id"],
-            comment="MovieLens: avaliações tipadas (escala 0.5 a 5)")
+# Dados a validar: lote mais recente de cada tabela bronze (o JSON do TMDB é interpretado primeiro)
+DATA_TO_VALIDATE = {
+    "imdb_title_basics":  read_bronze("imdb_title_basics"),
+    "imdb_title_ratings": read_bronze("imdb_title_ratings"),
+    "imdb_title_episode": read_bronze("imdb_title_episode"),
+    "tmdb_movie_details": (read_bronze("tmdb_movie_details")
+                           .select(F.from_json("payload", DETAIL_SCHEMA).alias("d"))
+                           .select("d.*")),
+    "ml_ratings":         read_bronze("ml_ratings"),
+    "ml_links":           read_bronze("ml_links"),
+    "ml_tags":            read_bronze("ml_tags"),
+}
 
-YEAR_PATTERN = r"\((\d{4})\)\s*$"
-ml_movies = (
-    spark.table(tbl(BRONZE, "ml_movies"))
-    .select(try_cast("movieId", "int").alias("movie_id"),
-            F.trim(F.regexp_replace("title", YEAR_PATTERN, "")).alias("title"),
-            F.when(F.regexp_extract("title", YEAR_PATTERN, 1) != "",
-                   F.regexp_extract("title", YEAR_PATTERN, 1).cast("int")).alias("year"),
-            F.filter(F.split("genres", r"\|"),
-                     lambda g: (g != "") & (g != "(no genres listed)")).alias("genres"))
-    .dropDuplicates(["movie_id"])
-)
-assert_unique(ml_movies, "movie_id", "silver.ml_movies")
-write_delta(ml_movies, SILVER, "ml_movies", comment="MovieLens: filmes com título, ano e géneros em array")
 
-ml_links = (
-    spark.table(tbl(BRONZE, "ml_links"))
-    .select(try_cast("movieId", "int").alias("movie_id"),
-            F.concat(F.lit("tt"), F.lpad("imdbId", 7, "0")).alias("tconst"),   # chave do IMDb
-            try_cast("tmdbId", "int").alias("tmdb_id"))                        # chave do TMDB
-    .dropDuplicates(["movie_id"])
-)
-assert_unique(ml_links, "movie_id", "silver.ml_links")
-write_delta(ml_links, SILVER, "ml_links",
-            comment="MovieLens: ponte movie_id <-> tconst (IMDb) <-> tmdb_id (TMDB)")
+def validate_table(table_name, df, rules):
+    """Conta nulos, inválidos e valores fora do intervalo em cada coluna, numa só leitura da tabela."""
+    columns = [rule["col"] for rule in rules]
+    # Passa tudo a texto e trata '\N' (IMDb) e '' como valores em falta
+    df = df.select([F.col(c).cast("string").alias(c) for c in columns]).replace(["\\N", ""], None)
 
-ml_tags = (
-    spark.table(tbl(BRONZE, "ml_tags"))
-    .select(try_cast("userId", "int").alias("user_id"),
-            try_cast("movieId", "int").alias("movie_id"),
-            F.lower(F.trim("tag")).alias("tag"),
-            F.timestamp_seconds(try_cast("timestamp", "bigint")).alias("tagged_at"))
-    .where(F.col("tag").isNotNull() & (F.col("tag") != ""))
-)
-write_delta(ml_tags, SILVER, "ml_tags", comment="MovieLens: tags de texto livre normalizadas (minúsculas)")
+    counts = [F.count("*").alias("total")]
+    for rule in rules:
+        c = rule["col"]
+        value = F.col(c)
+        typed = try_cast(c, rule["type"])
+
+        # inválido: tem valor mas não converte para o tipo esperado, ou não segue o formato
+        is_invalid = value.isNotNull() & typed.isNull()
+        if "regex" in rule:
+            is_invalid = is_invalid | (value.isNotNull() & ~value.rlike(rule["regex"]))
+
+        # fora do intervalo [min, max]
+        is_out = F.lit(False)
+        if "min" in rule:
+            is_out = is_out | (typed < rule["min"])
+        if "max" in rule:
+            is_out = is_out | (typed > rule["max"])
+
+        counts.append(F.sum(F.when(value.isNull(), 1).otherwise(0)).alias(f"{c}__nulos"))
+        counts.append(F.sum(F.when(is_invalid, 1).otherwise(0)).alias(f"{c}__invalidos"))
+        counts.append(F.sum(F.when(is_out, 1).otherwise(0)).alias(f"{c}__fora"))
+
+    result = df.agg(*counts).first()   # <- ação: só aqui o Spark lê os dados
+
+    report = []
+    total = result["total"]
+    for rule in rules:
+        c = rule["col"]
+        role = rule["role"]
+        nulls = result[f"{c}__nulos"] or 0
+        invalid = result[f"{c}__invalidos"] or 0
+        out = result[f"{c}__fora"] or 0
+        pct_nulls = round(100 * nulls / total, 2) if total else 0.0
+        pct_bad = round(100 * (invalid + out) / total, 2) if total else 0.0
+
+        if role == "chave" and pct_nulls + pct_bad > MAX_BAD_KEYS_PCT:
+            status = "FAIL"
+        elif role in ("ligacao", "feature") and pct_bad > MAX_BAD_FEATURE_PCT:
+            status = "WARN"
+        else:
+            status = "OK"
+        report.append((table_name, c, role, rule["type"], total, nulls, pct_nulls, invalid, out, pct_bad, status))
+    return report
+
+
+dq_rows = []
+for table_name, rules in FEATURE_RULES.items():
+    dq_rows = dq_rows + validate_table(table_name, DATA_TO_VALIDATE[table_name], rules)
+
+dq_report = spark.createDataFrame(
+    dq_rows,
+    "tabela string, coluna string, papel string, tipo string, linhas long, nulos long, pct_nulos double, "
+    "invalidos long, fora_intervalo long, pct_problemas double, estado string",
+).withColumn("_batch_id", F.lit(BATCH_ID))
+
+save_table(dq_report, SILVER, "dq_feature_report", mode="append",
+           comment="Validação das features da bronze antes do carregamento da silver")
+display(dq_report.orderBy(F.desc("estado"), "tabela"))
+
+n_fail = len([row for row in dq_rows if row[-1] == "FAIL"])
+n_warn = len([row for row in dq_rows if row[-1] == "WARN"])
+print(f"Colunas validadas: {len(dq_rows)} | avisos (WARN): {n_warn} | erros (FAIL): {n_fail}")
+if n_fail > 0:
+    raise ValueError("Há chaves com problemas (ver tabela acima): a silver não é carregada.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Silver integrada: `silver.movies_unified`
+# MAGIC ### 4.2 a 4.4 Silver de cada fonte
 # MAGIC
-# MAGIC Junta as três fontes por chave. O **IMDb é a tabela grande** e as restantes são pequenas, por isso usam-se **Broadcast Hash Joins**. O plano de execução (`explain`) mostra isso mesmo.
-# MAGIC Valores `0` de orçamento, receita e votos do TMDB significam "desconhecido", por isso passam a `null`.
+# MAGIC | Fonte | Limpeza e transformação |
+# MAGIC |---|---|
+# MAGIC | **IMDb** | `\N` passa a `null`; ficam só filmes e séries sem conteúdo adulto; tipos convertidos com `try_cast`; géneros em lista; nota e votos juntos a cada título; nas séries, número de temporadas e de episódios a partir do `title.episode` |
+# MAGIC | **TMDB** | interpretar o JSON com `from_json`, converter datas e remover duplicados |
+# MAGIC | **MovieLens** | converter o `timestamp` em data, construir a chave do IMDb (`tconst`) e normalizar as tags |
+# MAGIC
+# MAGIC As tabelas maiores usam **Liquid Clustering** (aula #07): o Delta organiza os ficheiros pelas colunas indicadas, para que as consultas que filtram por essas colunas leiam menos dados.
 
 # COMMAND ----------
 
-# =========================== SILVER INTEGRADA ================================
-imdb  = spark.table(tbl(SILVER, "imdb_movies"))
-links = spark.table(tbl(SILVER, "ml_links"))
-tmdb  = spark.table(tbl(SILVER, "tmdb_movie_details"))
+# ============================== 4.2 SILVER · IMDb ==============================
+# No IMDb, os valores em falta vêm como \N: replace passa-os a null
+imdb_ratings = (read_bronze("imdb_title_ratings")
+                .replace("\\N", None)
+                .select("tconst",
+                        try_cast("averageRating", "double").alias("imdb_rating"),
+                        try_cast("numVotes", "bigint").alias("imdb_votes"))
+                .dropDuplicates(["tconst"]))
 
+imdb_titles = (read_bronze("imdb_title_basics")
+               .replace("\\N", None)
+               .where(F.col("titleType").isin(MOVIE_TYPES + SERIES_TYPES))       # só filmes e séries
+               .where(F.col("isAdult").isNull() | (F.col("isAdult") != "1"))     # sem conteúdo adulto
+               .select("tconst",
+                       F.col("primaryTitle").alias("title"),
+                       F.col("titleType").alias("title_type"),
+                       F.when(F.col("titleType").isin(MOVIE_TYPES), "Filme")
+                        .otherwise("Série").alias("content_type"),
+                       try_cast("startYear", "int").alias("start_year"),
+                       try_cast("endYear", "int").alias("end_year"),             # só as séries têm ano de fim
+                       try_cast("runtimeMinutes", "int").alias("runtime_minutes"),
+                       F.split("genres", ",").alias("genres"))   # "Drama,Romance" -> ["Drama", "Romance"]
+               .dropDuplicates(["tconst"])
+               .join(imdb_ratings, on="tconst", how="left"))
+check_unique(imdb_titles, "tconst", "silver.imdb_titles")
+imdb_titles = save_table(imdb_titles, SILVER, "imdb_titles", cluster_by=["content_type", "start_year"],
+                         comment="IMDb: filmes e séries (sem conteúdo adulto) com nota e votos")
+
+# Séries: número de temporadas e de episódios (cada linha do title.episode é um episódio)
+imdb_series_stats = (read_bronze("imdb_title_episode")
+                     .replace("\\N", None)
+                     .select(F.col("parentTconst").alias("tconst"),
+                             try_cast("seasonNumber", "int").alias("season"))
+                     .groupBy("tconst")
+                     .agg(F.count("*").alias("n_episodes"),
+                          F.max("season").alias("n_seasons")))
+save_table(imdb_series_stats, SILVER, "imdb_series_stats",
+           comment="IMDb: número de temporadas e de episódios de cada série")
+
+# Relação título-género: explode cria uma linha por cada género da lista
+imdb_title_genres = imdb_titles.select("tconst", "content_type", F.explode("genres").alias("genre"))
+save_table(imdb_title_genres, SILVER, "imdb_title_genres", comment="IMDb: géneros de cada título")
+
+# COMMAND ----------
+
+# ============================== 4.3 SILVER · TMDB ==============================
+# Detalhe dos filmes: orçamento, receita, idioma original (complementa os filmes do IMDb)
+tmdb_details = (read_bronze("tmdb_movie_details")
+                .select(F.from_json("payload", DETAIL_SCHEMA).alias("d"))
+                .select("d.*")
+                .replace("", None)                                    # texto vazio passa a null
+                .select(F.col("id").alias("tmdb_id"), "imdb_id", "title", "original_language", "overview",
+                        to_date_safe("release_date").alias("release_date"),
+                        F.col("runtime").alias("runtime_minutes"),
+                        "budget", "revenue", "popularity", "vote_average", "vote_count")
+                .where(F.col("tmdb_id").isNotNull())
+                .dropDuplicates(["tmdb_id"]))
+check_unique(tmdb_details, "tmdb_id", "silver.tmdb_movie_details")
+save_table(tmdb_details, SILVER, "tmdb_movie_details",
+           comment="TMDB: detalhe dos filmes (orçamento, receita, idioma, sinopse)")
+
+# Filmes das listas do TMDB (popular, top_rated, now_playing): um filme pode estar em várias listas
+tmdb_movies = (read_bronze("tmdb_movie_lists")
+               .select("list_name", F.from_json("payload", LIST_MOVIE_SCHEMA).alias("m"))
+               .select("list_name", "m.*")
+               .groupBy(F.col("id").alias("tmdb_id"))
+               .agg(F.first("title").alias("title"),
+                    F.max("vote_average").alias("vote_average"),
+                    F.max("vote_count").alias("vote_count"),
+                    F.collect_set("list_name").alias("lists")))
+check_unique(tmdb_movies, "tmdb_id", "silver.tmdb_movies")
+save_table(tmdb_movies, SILVER, "tmdb_movies", comment="TMDB: filmes das listas e listas onde aparecem")
+
+# COMMAND ----------
+
+# =========================== 4.4 SILVER · MovieLens ============================
+ml_ratings = (read_bronze("ml_ratings")
+              .select(try_cast("userId", "int").alias("user_id"),
+                      try_cast("movieId", "int").alias("movie_id"),
+                      try_cast("rating", "double").alias("rating"),
+                      F.timestamp_seconds(try_cast("timestamp", "bigint")).alias("rated_at"))   # segundos -> data
+              .where(F.col("movie_id").isNotNull() & F.col("rating").isNotNull())
+              .dropDuplicates(["user_id", "movie_id", "rated_at"]))
+save_table(ml_ratings, SILVER, "ml_ratings", cluster_by=["movie_id"],
+           comment="MovieLens: avaliações dos utilizadores (escala 0.5 a 5)")
+
+# Chave do IMDb: "114709" -> "tt0114709" (zeros à esquerda até 7 dígitos).
+# Ids com 8 dígitos (filmes recentes) ficam como estão: o lpad cortaria o último dígito.
+ml_links = (read_bronze("ml_links")
+            .select(try_cast("movieId", "int").alias("movie_id"),
+                    F.when(F.length("imdbId") >= 7, F.concat(F.lit("tt"), F.col("imdbId")))
+                     .otherwise(F.concat(F.lit("tt"), F.lpad("imdbId", 7, "0"))).alias("tconst"),
+                    try_cast("tmdbId", "int").alias("tmdb_id"))
+            .where(F.col("movie_id").isNotNull())
+            .dropDuplicates(["movie_id"]))
+check_unique(ml_links, "movie_id", "silver.ml_links")
+save_table(ml_links, SILVER, "ml_links", comment="MovieLens: ligação movie_id - tconst (IMDb) - tmdb_id (TMDB)")
+
+# Tags de texto livre (dados não estruturados): minúsculas e sem espaços a mais
+ml_tags = (read_bronze("ml_tags")
+           .select(try_cast("userId", "int").alias("user_id"),
+                   try_cast("movieId", "int").alias("movie_id"),
+                   F.lower(F.trim("tag")).alias("tag"),
+                   F.timestamp_seconds(try_cast("timestamp", "bigint")).alias("tagged_at"))
+           .where(F.col("tag").isNotNull() & (F.col("tag") != "")))
+save_table(ml_tags, SILVER, "ml_tags", comment="MovieLens: tags de texto livre normalizadas")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.5 Silver integrada: `silver.titles_unified`
+# MAGIC
+# MAGIC Junta tudo numa só tabela, com **um título do IMDb por linha**:
+# MAGIC - todos os filmes e séries do IMDb, com nota e votos (fonte principal);
+# MAGIC - nas séries, o número de temporadas e de episódios;
+# MAGIC - nos filmes que existem no MovieLens, a nota dos utilizadores do MovieLens e os dados do TMDB (orçamento, receita, idioma).
+# MAGIC
+# MAGIC As tabelas pequenas (ligações do MovieLens, TMDB, notas do MovieLens) entram com **Broadcast Join** (aula #04): em vez de redistribuir a tabela grande pela rede (*shuffle*), o Spark envia uma cópia da tabela pequena para cada nó. O `explain` mostra o plano de execução com o `BroadcastHashJoin`.
+# MAGIC
+# MAGIC No TMDB, orçamento, receita e votos iguais a `0` significam "desconhecido", por isso passam a `null`.
+
+# COMMAND ----------
+
+# ========================== 4.5 SILVER INTEGRADA ===============================
+titles       = spark.table(tbl(SILVER, "imdb_titles"))
+series_stats = spark.table(tbl(SILVER, "imdb_series_stats"))
+
+# Ligação MovieLens -> IMDb: um movie_id por tconst
+links = (spark.table(tbl(SILVER, "ml_links"))
+         .where(F.col("tconst").isNotNull())
+         .dropDuplicates(["tconst"]))
+
+# Nota média e número de avaliações de cada filme no MovieLens
 ml_stats = (spark.table(tbl(SILVER, "ml_ratings"))
             .groupBy("movie_id")
             .agg(F.round(F.avg("rating"), 3).alias("ml_avg_rating"),
                  F.count("*").alias("ml_num_ratings")))
 
-tmdb_sel = tmdb.select(
-    "tmdb_id", "original_language", "overview",
-    F.when(F.col("vote_count") > 0, F.col("vote_average")).alias("tmdb_vote_average"),
-    F.col("vote_count").alias("tmdb_vote_count"),
-    F.col("popularity").alias("tmdb_popularity"),
-    F.when(F.col("budget") > 0, F.col("budget")).alias("budget"),
-    F.when(F.col("revenue") > 0, F.col("revenue")).alias("revenue"),
-    F.lit(True).alias("in_tmdb"),
-)
+tmdb_selected = (spark.table(tbl(SILVER, "tmdb_movie_details"))
+                 .select("tmdb_id", "original_language", "overview",
+                         F.when(F.col("vote_count") > 0, F.col("vote_average")).alias("tmdb_vote_average"),
+                         F.when(F.col("budget") > 0, F.col("budget")).alias("budget"),
+                         F.when(F.col("revenue") > 0, F.col("revenue")).alias("revenue")))
 
-unified = (
-    imdb.join(F.broadcast(links), "tconst", "inner")        # IMDb (grande) x ponte MovieLens (pequena)
-        .join(F.broadcast(tmdb_sel), "tmdb_id", "left")     # + TMDB
-        .join(F.broadcast(ml_stats), "movie_id", "left")    # + avaliações MovieLens
-        .select("movie_id", "tconst", "tmdb_id", "title", "start_year",
-                (F.floor(F.col("start_year") / 10) * 10).alias("decade"),
-                "runtime_minutes", "genres", "imdb_rating", "imdb_votes",
-                "ml_avg_rating", (F.col("ml_avg_rating") * 2).alias("ml_rating_10"), "ml_num_ratings",
-                "tmdb_vote_average", "tmdb_vote_count", "tmdb_popularity",
-                "budget", "revenue", "original_language", "overview",
-                F.coalesce(F.col("in_tmdb"), F.lit(False)).alias("in_tmdb"))
-)
+titles_unified = (titles
+                  .join(series_stats, on="tconst", how="left")                   # + temporadas/episódios
+                  .join(F.broadcast(links), on="tconst", how="left")             # + ligação ao MovieLens
+                  .join(F.broadcast(tmdb_selected), on="tmdb_id", how="left")    # + TMDB
+                  .join(F.broadcast(ml_stats), on="movie_id", how="left")        # + notas MovieLens
+                  .select("tconst", "title", "title_type", "content_type",
+                          "start_year", "end_year",
+                          (F.floor(F.col("start_year") / 10) * 10).alias("decade"),   # 1994 -> 1990
+                          "runtime_minutes", "genres", "imdb_rating", "imdb_votes",
+                          "n_seasons", "n_episodes",
+                          "movie_id", "tmdb_id",
+                          (F.col("ml_avg_rating") * 2).alias("ml_rating_10"),         # escala 0-5 -> 0-10
+                          "ml_num_ratings", "tmdb_vote_average",
+                          "budget", "revenue", "original_language", "overview"))
 
-unified.explain(mode="formatted")  # evidência do BroadcastHashJoin para o relatório
+titles_unified.explain(mode="formatted")   # plano de execução: procurar "BroadcastHashJoin"
 
-assert_unique(unified, "movie_id", "silver.movies_unified")
-unified = write_delta(unified, SILVER, "movies_unified", cluster_by=["decade", "start_year"],
-                      comment="Filmes integrados (IMDb + MovieLens + TMDB); ml_rating_10 = nota MovieLens na escala 0-10")
+check_unique(titles_unified, "tconst", "silver.titles_unified")
+titles_unified = save_table(titles_unified, SILVER, "titles_unified", cluster_by=["content_type", "decade"],
+                            comment="Filmes e séries do IMDb, enriquecidos com MovieLens e TMDB")
 
-# Cobertura entre fontes
-total, with_tmdb, with_ml = unified.agg(
-    F.count("*"),
-    F.sum(F.col("in_tmdb").cast("int")),
-    F.sum(F.col("ml_num_ratings").isNotNull().cast("int"))).first()
-print(f"Filmes integrados: {total:,} | com TMDB: {with_tmdb:,} | com avaliações MovieLens: {with_ml:,}")
+# Quantos títulos há de cada tipo, e quantos têm dados das fontes complementares?
+display(titles_unified.groupBy("content_type")
+        .agg(F.count("*").alias("titulos"),
+             F.count("imdb_rating").alias("com_nota_imdb"),
+             F.count("n_seasons").alias("com_temporadas"),
+             F.count("ml_rating_10").alias("com_nota_movielens"),
+             F.count("budget").alias("com_orcamento_tmdb")))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Gold: tabelas para responder à pergunta de negócio
+# MAGIC ### 4.6 Datamart de negócio (camada Gold)
 # MAGIC
-# MAGIC Para evitar ruído usam-se limiares mínimos (`MIN_IMDB_VOTES`, `MIN_ML_RATINGS`). A nota do MovieLens é multiplicada por 2 (`ml_rating_10`) para ficar na mesma escala 0-10 do IMDb e do TMDB.
-# MAGIC Os géneros usados são os do IMDb (inglês), porque os do TMDB vêm no idioma pedido (pt-PT).
+# MAGIC **`gold.dm_titles`** é a tabela principal do datamart: um título por linha, com a nota do IMDb (medida principal de qualidade), os fatores em estudo e as respetivas classes (duração, popularidade, temporadas). A coluna `is_reliable` indica se o título tem votos suficientes (`MIN_IMDB_VOTES`) para entrar na análise.
+# MAGIC
+# MAGIC A partir dela criam-se as tabelas que respondem às perguntas:
+# MAGIC
+# MAGIC | Tabela | Pergunta |
+# MAGIC |---|---|
+# MAGIC | `gold.top_titles` | Quais são os melhores filmes e séries de todos os tempos? |
+# MAGIC | `gold.rating_by_factor` | Como varia a nota com a década, o género, a duração, a popularidade e as temporadas? |
+# MAGIC | `gold.rating_drivers` | Que fatores numéricos estão mais associados a uma nota alta? |
+# MAGIC | `gold.imdb_vs_other_sources` | A nota do IMDb é consistente com o MovieLens e o TMDB? |
+# MAGIC | `gold.roi_by_genre` | Nos filmes, a qualidade acompanha o retorno financeiro? |
+# MAGIC
+# MAGIC **Nota ponderada (ranking):** ordenar só pela nota favorece títulos com poucos votos (uma nota 9,8 com 1 200 votos vale menos do que 9,3 com 2 milhões). Por isso o ranking usa a média ponderada que o IMDb usou no seu Top 250:
+# MAGIC
+# MAGIC `nota ponderada = v / (v + m) × R + m / (v + m) × C`
+# MAGIC
+# MAGIC onde `R` é a nota do título, `v` o número de votos, `m` = `TOP_MIN_VOTES` e `C` a nota média de todos os títulos do mesmo tipo. Com poucos votos, a nota aproxima-se da média; com muitos, aproxima-se da nota real.
 
 # COMMAND ----------
 
-# ================================== GOLD =====================================
-MIN_IMDB_VOTES = 1000
-MIN_ML_RATINGS = 5
+# ======================== 4.6 DATAMART DE NEGÓCIO (GOLD) =======================
+titles_unified = spark.table(tbl(SILVER, "titles_unified"))
 
-base = (spark.table(tbl(SILVER, "movies_unified"))
-        .where((F.col("imdb_votes") >= MIN_IMDB_VOTES)
-               & (F.col("ml_num_ratings") >= MIN_ML_RATINGS)
-               & F.col("decade").isNotNull()))
+runtime   = F.col("runtime_minutes")
+votes     = F.col("imdb_votes")
+seasons   = F.col("n_seasons")
+rating    = F.col("imdb_rating")
 
-rating_metrics = [
-    F.count("*").alias("n_movies"),
-    F.round(F.avg("imdb_rating"), 2).alias("avg_imdb_rating"),
-    F.round(F.avg("ml_rating_10"), 2).alias("avg_movielens_rating_10"),
-    F.round(F.avg("tmdb_vote_average"), 2).alias("avg_tmdb_rating"),
-]
+dm_titles = titles_unified.select(
+    "tconst", "title", "title_type", "content_type",
+    F.col("start_year").alias("year"), "decade", "end_year",
+    "runtime_minutes", "genres",
+    F.expr("try_element_at(genres, 1)").alias("main_genre"),       # primeiro género (null se não houver)
+    F.when(F.col("genres").isNotNull(), F.size("genres")).alias("n_genres"),
+    rating.alias("rating_imdb"),
+    votes.alias("imdb_votes"),
+    F.round(F.log10(votes), 2).alias("log_votes"),                  # popularidade em escala logarítmica
+    "n_seasons", "n_episodes",
+    (F.col("end_year") - F.col("start_year") + 1).alias("series_years"),   # anos em exibição (séries terminadas)
 
-# 1) Nota média por fonte e por década
-by_decade = base.groupBy("decade").agg(*rating_metrics, F.sum(F.col("in_tmdb").cast("int")).alias("n_with_tmdb"))
-write_delta(by_decade, GOLD, "ratings_by_decade", comment="Nota média por fonte e década")
+    # Classes de cada fator (o número no início serve para ordenar)
+    F.when(runtime < 60, "1: <60 min")
+     .when(runtime < 90, "2: 60-89 min")
+     .when(runtime < 120, "3: 90-119 min")
+     .when(runtime < 150, "4: 120-149 min")
+     .when(runtime >= 150, "5: 150+ min").alias("runtime_class"),
+    F.when(votes < 1000, "1: <1k")
+     .when(votes < 10000, "2: 1k-10k")
+     .when(votes < 100000, "3: 10k-100k")
+     .when(votes < 1000000, "4: 100k-1M")
+     .when(votes >= 1000000, "5: 1M+").alias("votes_class"),
+    F.when(seasons == 1, "1: 1 temporada")
+     .when(seasons <= 3, "2: 2-3 temporadas")
+     .when(seasons <= 6, "3: 4-6 temporadas")
+     .when(seasons >= 7, "4: 7+ temporadas").alias("seasons_class"),
+    F.when(rating >= 8, "1: Excelente (8+)")
+     .when(rating >= 7, "2: Bom (7-8)")
+     .when(rating >= 5.5, "3: Médio (5.5-7)")
+     .when(rating < 5.5, "4: Fraco (<5.5)").alias("quality_class"),
 
-# 2) Nota média por fonte e por género (género do IMDb)
-by_genre = (base.withColumn("genre", F.explode("genres"))
-            .groupBy("genre").agg(*rating_metrics)
-            .where(F.col("n_movies") >= 10))
-write_delta(by_genre, GOLD, "ratings_by_genre", comment="Nota média por fonte e género (IMDb, mín. 10 filmes)")
+    # Fontes complementares (só filmes do MovieLens)
+    F.col("ml_rating_10").alias("rating_movielens"),
+    F.col("tmdb_vote_average").alias("rating_tmdb"),
+    F.round(rating - F.col("ml_rating_10"), 2).alias("gap_imdb_vs_movielens"),
+    "budget", "revenue",
+    F.round(F.col("revenue") / F.col("budget"), 2).alias("roi"),         # retorno: receita / orçamento
+    "original_language",
+    F.coalesce((votes >= MIN_IMDB_VOTES) & F.col("decade").isNotNull(), F.lit(False)).alias("is_reliable"),
+)
 
-# 3) Filmes onde o IMDb e o MovieLens mais divergem
-gaps = (base.select("movie_id", "tconst", "title", "start_year", "imdb_rating", "imdb_votes",
-                    "ml_rating_10", "ml_num_ratings",
-                    F.round(F.col("imdb_rating") - F.col("ml_rating_10"), 2).alias("gap_imdb_minus_ml"))
-        .withColumn("abs_gap", F.abs("gap_imdb_minus_ml")))
-write_delta(gaps, GOLD, "movie_rating_gaps", cluster_by=["start_year"],
-            comment="Diferença entre a nota IMDb e a nota MovieLens (escala 0-10) por filme")
+check_unique(dm_titles, "tconst", "gold.dm_titles")
+dm_titles = save_table(dm_titles, GOLD, "dm_titles", cluster_by=["content_type", "decade"],
+                       comment="Datamart de filmes e séries: nota IMDb e fatores de qualidade")
+reliable = dm_titles.where(F.col("is_reliable"))
 
-# 4) Retorno financeiro por género (só filmes com orçamento e receita conhecidos no TMDB)
-roi = (spark.table(tbl(SILVER, "movies_unified"))
-       .where(F.col("budget").isNotNull() & F.col("revenue").isNotNull())
-       .withColumn("genre", F.explode("genres"))
-       .withColumn("roi", F.col("revenue") / F.col("budget"))
-       .groupBy("genre")
-       .agg(F.count("*").alias("n_movies"),
-            F.round(F.avg("roi"), 2).alias("avg_roi"),
-            F.round(F.percentile_approx("roi", 0.5), 2).alias("median_roi"),
-            F.round(F.avg("imdb_rating"), 2).alias("avg_imdb_rating"))
-       .where(F.col("n_movies") >= 5))
-write_delta(roi, GOLD, "roi_by_genre", comment="Retorno (receita/orçamento) por género, filmes com TMDB")
+# COMMAND ----------
+
+# ----------- 1) Melhores filmes e séries de todos os tempos (Spark SQL) -----------
+# Window function (aula #06): ROW_NUMBER() numera os títulos dentro de cada tipo (Filme / Série)
+spark.sql(f"""
+    CREATE OR REPLACE TABLE {tbl(GOLD, 'top_titles')} AS
+    WITH type_means AS (
+        SELECT content_type, AVG(rating_imdb) AS mean_rating
+        FROM {tbl(GOLD, 'dm_titles')}
+        WHERE is_reliable
+        GROUP BY content_type
+    ),
+    scored AS (
+        SELECT d.content_type, d.title, d.year, d.main_genre, d.rating_imdb, d.imdb_votes,
+               ROUND(d.imdb_votes / (d.imdb_votes + {TOP_MIN_VOTES}) * d.rating_imdb
+                     + {TOP_MIN_VOTES} / (d.imdb_votes + {TOP_MIN_VOTES}) * m.mean_rating, 3) AS weighted_rating
+        FROM {tbl(GOLD, 'dm_titles')} d
+        JOIN type_means m ON d.content_type = m.content_type
+        WHERE d.is_reliable
+    ),
+    ranked AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY content_type ORDER BY weighted_rating DESC) AS ranking
+        FROM scored
+    )
+    SELECT * FROM ranked WHERE ranking <= 25
+""")
+print(f"[gold] {tbl(GOLD, 'top_titles')}: top 25 de filmes e de séries (Spark SQL)")
+
+# ----------- 2) Nota média por fator (DataFrame API) ---------------------------
+# Para cada fator: número de títulos e nota média do IMDb, por tipo de conteúdo
+FACTORS = {
+    "década":       "decade",
+    "género":       "genre",            # cada título conta em todos os seus géneros (explode)
+    "duração":      "runtime_class",
+    "popularidade": "votes_class",
+    "temporadas":   "seasons_class",    # só séries
+    "idioma":       "original_language",  # só filmes com TMDB
+}
+
+factor_tables = []
+for factor_name, column in FACTORS.items():
+    data = reliable
+    if column == "genre":
+        data = reliable.withColumn("genre", F.explode("genres"))
+    summary = (data
+               .where(F.col(column).isNotNull())
+               .groupBy("content_type", column)
+               .agg(F.count("*").alias("n_titles"),
+                    F.round(F.avg("rating_imdb"), 2).alias("avg_imdb_rating"),
+                    F.round(F.stddev("rating_imdb"), 2).alias("std_imdb_rating"))
+               .where(F.col("n_titles") >= MIN_TITLES_PER_GROUP)
+               .select(F.lit(factor_name).alias("factor"), "content_type",
+                       F.col(column).cast("string").alias("value"),
+                       "n_titles", "avg_imdb_rating", "std_imdb_rating"))
+    factor_tables.append(summary)
+
+rating_by_factor = factor_tables[0]
+for summary in factor_tables[1:]:
+    rating_by_factor = rating_by_factor.unionByName(summary)
+save_table(rating_by_factor, GOLD, "rating_by_factor", comment="Nota média do IMDb por fator e tipo de conteúdo")
+
+# ----------- 3) Fatores numéricos associados à nota (correlação) -------------
+# Correlação de Pearson entre a nota do IMDb e cada fator (-1 a 1). Mede associação, não causalidade.
+DRIVERS = {
+    "Filme": ["year", "runtime_minutes", "log_votes", "n_genres", "budget", "rating_movielens"],
+    "Série": ["year", "runtime_minutes", "log_votes", "n_genres", "n_seasons", "n_episodes", "series_years"],
+}
+driver_rows = []
+for content_type, drivers in DRIVERS.items():
+    subset = reliable.where(F.col("content_type") == content_type)
+    correlations = subset.agg(*[F.corr("rating_imdb", d).alias(d) for d in drivers]).first()
+    for d in drivers:
+        value = correlations[d]
+        driver_rows.append((content_type, d, round(value, 3) if value is not None else None))
+
+rating_drivers = spark.createDataFrame(driver_rows, "content_type string, factor string, correlation double")
+save_table(rating_drivers, GOLD, "rating_drivers", comment="Correlação entre a nota do IMDb e cada fator numérico")
+
+# ----------- 4) A nota do IMDb é consistente com as outras fontes? (filmes) ---
+imdb_vs_other_sources = (reliable
+                         .where(F.col("rating_movielens").isNotNull())
+                         .groupBy("decade")
+                         .agg(F.count("*").alias("n_movies"),
+                              F.round(F.avg("rating_imdb"), 2).alias("avg_imdb_rating"),
+                              F.round(F.avg("rating_movielens"), 2).alias("avg_movielens_rating"),
+                              F.round(F.avg("rating_tmdb"), 2).alias("avg_tmdb_rating"),
+                              F.round(F.corr("rating_imdb", "rating_movielens"), 3).alias("corr_imdb_movielens"))
+                         .where(F.col("n_movies") >= MIN_TITLES_PER_GROUP))
+save_table(imdb_vs_other_sources, GOLD, "imdb_vs_other_sources",
+           comment="Filmes: nota IMDb vs MovieLens (0-10) e TMDB, por década")
+
+# ----------- 5) Qualidade e retorno financeiro por género (filmes com TMDB) ---
+roi_by_genre = (reliable
+                .where(F.col("roi").isNotNull())
+                .withColumn("genre", F.explode("genres"))
+                .groupBy("genre")
+                .agg(F.count("*").alias("n_movies"),
+                     F.round(F.avg("rating_imdb"), 2).alias("avg_imdb_rating"),
+                     F.round(F.percentile_approx("roi", 0.5), 2).alias("median_roi"))
+                .where(F.col("n_movies") >= 5))
+save_table(roi_by_genre, GOLD, "roi_by_genre", comment="Filmes: nota IMDb e retorno (receita / orçamento) por género")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Análise e visualização
+# MAGIC ## 5. Análise e visualização
+# MAGIC
+# MAGIC As consultas usam apenas a camada gold (o datamart), que já está agregada e pronta para análise.
+# MAGIC
+# MAGIC ### 5.1 Os melhores filmes e séries de todos os tempos
 
 # COMMAND ----------
 
-display(spark.table(tbl(GOLD, "ratings_by_decade")).orderBy("decade"))
+display(spark.table(tbl(GOLD, "top_titles")).where("content_type = 'Filme'").orderBy("ranking"))
 
 # COMMAND ----------
 
-display(spark.table(tbl(GOLD, "ratings_by_genre")).orderBy(F.desc("n_movies")))
+display(spark.table(tbl(GOLD, "top_titles")).where("content_type = 'Série'").orderBy("ranking"))
 
 # COMMAND ----------
 
-# Os 20 filmes com maior divergência entre IMDb e MovieLens
-display(spark.table(tbl(GOLD, "movie_rating_gaps")).orderBy(F.desc("abs_gap")).limit(20))
+# MAGIC %md
+# MAGIC ### 5.2 Que fatores explicam a qualidade?
 
 # COMMAND ----------
 
-display(spark.table(tbl(GOLD, "roi_by_genre")).orderBy(F.desc("median_roi")))
+# Nota média por fator: comparar filmes e séries em cada classe
+display(spark.table(tbl(GOLD, "rating_by_factor")).orderBy("factor", "content_type", "value"))
 
 # COMMAND ----------
 
-import matplotlib.pyplot as plt
-
-# toPandas() só é aceitável aqui: tabela gold já agregada (poucas linhas)
-pdf = spark.table(tbl(GOLD, "ratings_by_decade")).orderBy("decade").toPandas()
+# Gráfico: nota média por década, filmes vs séries
+# O toPandas() só é aceitável aqui porque a tabela gold é pequena (uma linha por década e tipo)
+pdf = (spark.table(tbl(GOLD, "rating_by_factor"))
+       .where(F.col("factor") == "década")
+       .orderBy("value")
+       .toPandas())
 
 fig, ax = plt.subplots(figsize=(9, 4.5))
-for col, label in [("avg_imdb_rating", "IMDb"),
-                   ("avg_movielens_rating_10", "MovieLens (escala 0-10)"),
-                   ("avg_tmdb_rating", "TMDB")]:
-    ax.plot(pdf["decade"], pdf[col], marker="o", label=label)
-ax.set_title("Nota média por década e fonte")
+for content_type in ["Filme", "Série"]:
+    data = pdf[pdf["content_type"] == content_type]
+    ax.plot(data["value"], data["avg_imdb_rating"], marker="o", label=content_type)
+ax.set_title("Nota média do IMDb por década")
 ax.set_xlabel("Década")
 ax.set_ylabel("Nota média (0-10)")
 ax.grid(alpha=0.3)
@@ -731,48 +964,97 @@ plt.show()
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 7. Otimização e evidências para o relatório
-# MAGIC
-# MAGIC Comentar em Markdown, com base nos resultados abaixo: lazy execution e lineage (`explain`), Broadcast Hash Join, Adaptive Query Execution, Liquid Clustering e Delta Lake (`DESCRIBE HISTORY`).
-# MAGIC _Opcional:_ comparar o tamanho e o tempo de leitura de CSV, Parquet e Delta para a mesma tabela.
+# Correlação de cada fator numérico com a nota do IMDb
+display(spark.table(tbl(GOLD, "rating_drivers")).orderBy("content_type", F.desc("correlation")))
 
 # COMMAND ----------
 
-# Plano de execução de uma consulta gold (procurar BroadcastHashJoin / AdaptiveSparkPlan)
-(spark.table(tbl(SILVER, "movies_unified"))
-      .join(F.broadcast(spark.table(tbl(SILVER, "ml_movies")).select("movie_id", F.col("year").alias("ml_year"))),
-            "movie_id")
-      .where(F.col("decade") == 1990)
-      .groupBy("decade").agg(F.avg("imdb_rating").alias("avg_imdb_rating"))
+# Gráfico: correlações lado a lado para filmes e séries
+pdf_drivers = spark.table(tbl(GOLD, "rating_drivers")).toPandas()
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, content_type in zip(axes, ["Filme", "Série"]):
+    data = pdf_drivers[pdf_drivers["content_type"] == content_type].sort_values("correlation")
+    ax.barh(data["factor"], data["correlation"])
+    ax.axvline(0, color="grey", linewidth=0.8)
+    ax.set_title(f"{content_type}: correlação com a nota IMDb")
+    ax.set_xlim(-1, 1)
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.3 A nota do IMDb é consistente com outras fontes? (filmes)
+
+# COMMAND ----------
+
+display(spark.table(tbl(GOLD, "imdb_vs_other_sources")).orderBy("decade"))
+
+# COMMAND ----------
+
+display(spark.table(tbl(GOLD, "roi_by_genre")).orderBy(F.desc("avg_imdb_rating")))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Tecnologias Big Data: evidências
+# MAGIC
+# MAGIC - **Lazy evaluation e plano de execução** (aula #04): o `explain` mostra o plano que o Spark otimizou antes de ler os dados (procurar `BroadcastHashJoin` e `AdaptiveSparkPlan`).
+# MAGIC - **Delta Lake** (aula #07): cada escrita cria uma nova versão da tabela (`DESCRIBE HISTORY`) e é possível consultar uma versão antiga (**time travel**).
+# MAGIC - **Liquid Clustering:** `DESCRIBE DETAIL` mostra as colunas pelas quais a tabela está organizada.
+
+# COMMAND ----------
+
+# Plano de execução: filtro por tipo e década (beneficia do Liquid Clustering) e agregação por género
+(spark.table(tbl(GOLD, "dm_titles"))
+      .where((F.col("content_type") == "Série") & (F.col("decade") == 2010))
+      .groupBy("main_genre")
+      .agg(F.avg("rating_imdb").alias("avg_imdb_rating"))
       .explain(mode="formatted"))
 
 # COMMAND ----------
 
-# Liquid Clustering: ver as colunas de clustering e o histórico (time travel) da tabela
-display(spark.sql(f"DESCRIBE DETAIL {tbl(SILVER, 'movies_unified')}")
-        .select("name", "format", "numFiles", "sizeInBytes", "clusteringColumns"))
-display(spark.sql(f"DESCRIBE HISTORY {tbl(SILVER, 'movies_unified')}")
+# Delta Lake: histórico de versões de uma tabela bronze (uma versão por cada leitura em append)
+display(spark.sql(f"DESCRIBE HISTORY {tbl(BRONZE, 'imdb_title_ratings')}")
         .select("version", "timestamp", "operation"))
+
+# Time travel: número de linhas na primeira versão da tabela e agora
+first_version = spark.sql(f"SELECT COUNT(*) AS n FROM {tbl(BRONZE, 'imdb_title_ratings')} VERSION AS OF 0").first()["n"]
+current       = spark.table(tbl(BRONZE, "imdb_title_ratings")).count()
+print(f"Linhas na versão 0: {first_version:,} | linhas agora: {current:,}")
 
 # COMMAND ----------
 
-# Inventário final: tabelas e linhas por camada
+# Liquid Clustering: colunas de organização do datamart
+display(spark.sql(f"DESCRIBE DETAIL {tbl(GOLD, 'dm_titles')}")
+        .select("name", "format", "numFiles", "sizeInBytes", "clusteringColumns"))
+
+# COMMAND ----------
+
+# Inventário final: todas as tabelas criadas e o número de linhas de cada uma
 inventory = []
 for layer in LAYERS:
     for row in spark.sql(f"SHOW TABLES IN {CATALOG}.{layer}").collect():
         if not row.isTemporary:
-            n = spark.table(tbl(layer, row.tableName)).count()
-            inventory.append((layer, row.tableName, n))
+            n_rows = spark.table(tbl(layer, row.tableName)).count()
+            inventory.append((layer, row.tableName, n_rows))
+
 display(spark.createDataFrame(inventory, "camada string, tabela string, linhas long").orderBy("camada", "tabela"))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Conclusões
+# MAGIC ## 7. Conclusões
 # MAGIC
-# MAGIC _(Responder à pergunta de negócio com base nas tabelas gold: diferenças de nota entre fontes, efeito do género e da década, retorno financeiro.)_
+# MAGIC **Os melhores de todos os tempos:** _(comentar o top 25 de filmes e de séries: géneros, décadas e tipos que dominam.)_
 # MAGIC
-# MAGIC **Limitações:** o MovieLens-small cobre ~9 mil filmes; o TMDB só tem detalhe para os filmes descarregados; os géneros do TMDB estão em português; os dados foram descarregados localmente por limitação da Free Edition.
+# MAGIC **Fatores de qualidade:** _(com base em `rating_by_factor` e `rating_drivers`: o que distingue os títulos com nota alta? diferenças entre filmes e séries?)_
 # MAGIC
-# MAGIC **Trabalho futuro:** usar um MovieLens maior, acrescentar `title.principals` do IMDb (elenco/realizadores) e analisar o texto das sinopses e tags.
+# MAGIC **Consistência da nota do IMDb:** _(a nota do IMDb acompanha a do MovieLens e a do TMDB? em que décadas divergem mais?)_
+# MAGIC
+# MAGIC **Processo e tecnologia:** _(bronze com histórico de leituras e reprocessamento, validação das features, datamart gold; Apache Spark no Databricks Free Edition, Delta Lake, Unity Catalog, Liquid Clustering, Broadcast Join, Spark SQL.)_
+# MAGIC
+# MAGIC **Limitações:** a nota do IMDb reflete quem vota no IMDb (não é uma medida objetiva); o MovieLens-small cobre cerca de 9 mil filmes e nenhuma série; o TMDB só tem detalhe para os filmes descarregados; a correlação mede associação e não causalidade.
+# MAGIC
+# MAGIC **Trabalho futuro:** acrescentar elenco e realizadores (`title.principals`, `title.crew`) como fatores, analisar o texto das sinopses e das tags, e treinar um modelo para prever a nota a partir dos fatores do datamart.

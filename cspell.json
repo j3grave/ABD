@@ -1,0 +1,6 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "ignorePaths": ["*.py", "*.ipynb", "*.sql", "*.pyi"],
+  "//": "O projeto está escrito em português (pt-PT); o dicionário inglês do cSpell marcava quase todas as palavras como erro."
+}

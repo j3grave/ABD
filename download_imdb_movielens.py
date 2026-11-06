@@ -8,7 +8,7 @@ Uso:
     python download_imdb_movielens.py                       # IMDb e MovieLens
     python download_imdb_movielens.py --sources imdb        # só o IMDb
     python download_imdb_movielens.py --force               # refaz tudo
-    python download_imdb_movielens.py --upload /Volumes/abd_project/landing/raw   # + upload (Databricks CLI)
+    python download_imdb_movielens.py --upload /Volumes/abd_project/bronze/raw   # + upload (Databricks CLI)
 
 Resultado:
     imdb_data/title.basics.movies.tsv.gz     (só titleType == movie)
@@ -201,7 +201,7 @@ def parse_args():
                    help="versão do MovieLens (ex.: ml-latest-small, ml-latest)")
     p.add_argument("--force", action="store_true", help="volta a descarregar e filtrar tudo")
     p.add_argument("--upload", metavar="RAW_ROOT",
-                   help="raiz do Volume, ex.: /Volumes/abd_project/landing/raw (cria imdb/ e movielens/)")
+                   help="raiz do Volume, ex.: /Volumes/abd_project/bronze/raw (cria imdb/ e movielens/)")
     p.add_argument("--profile", help="profile da Databricks CLI (para o upload)")
     return p.parse_args()
 
@@ -220,8 +220,8 @@ def main():
             print()
             step_upload(files, f"{args.upload.rstrip('/')}/{sub}", args.profile)
     else:
-        print("\nConcluído. Carrega as pastas para o Volume (landing/raw/imdb e landing/raw/movielens), "
-              "ou usa --upload /Volumes/<catalogo>/landing/raw")
+        print("\nConcluído. Carrega as pastas para o Volume (bronze/raw/imdb e bronze/raw/movielens), "
+              "ou usa --upload /Volumes/<catalogo>/bronze/raw")
 
 
 if __name__ == "__main__":

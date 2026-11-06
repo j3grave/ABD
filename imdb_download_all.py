@@ -6,7 +6,7 @@
 # MAGIC %md
 # MAGIC # IMDb: download diário de todos os ficheiros para o Volume
 # MAGIC
-# MAGIC Descarrega os 7 ficheiros dos datasets do IMDb (`name.basics`, `title.akas`, `title.basics`, `title.crew`, `title.episode`, `title.principals`, `title.ratings`) para `/Volumes/<catálogo>/landing/raw/imdb` e valida-os com Spark. Foi pensado para correr **todos os dias** como job agendado.
+# MAGIC Descarrega os 7 ficheiros dos datasets do IMDb (`name.basics`, `title.akas`, `title.basics`, `title.crew`, `title.episode`, `title.principals`, `title.ratings`) para `/Volumes/<catálogo>/bronze/raw/imdb` e valida-os com Spark. Foi pensado para correr **todos os dias** como job agendado.
 # MAGIC
 # MAGIC - O download é uma tarefa de I/O: usa-se Python (`requests`, em streaming, vários ficheiros em paralelo). O **PySpark** entra na validação (cabeçalhos e, opcionalmente, contagem de linhas).
 # MAGIC - **Só descarrega o que mudou:** guarda em `_manifest.json` o `ETag`/`Last-Modified` de cada ficheiro e ignora os que não mudaram desde a última execução. Os downloads vão primeiro para `.part` e só no fim ficam com o nome final, por isso uma execução interrompida nunca deixa um ficheiro truncado.
@@ -52,7 +52,7 @@ FORCE      = dbutils.widgets.get("overwrite") == "sim"
 PARALLEL   = max(1, int(dbutils.widgets.get("parallel")))
 COUNT_ROWS = dbutils.widgets.get("count_rows") == "sim"
 BASE_URL   = dbutils.widgets.get("base_url").strip().rstrip("/")
-DEST_DIR   = dbutils.widgets.get("dest_dir").strip() or f"/Volumes/{CATALOG}/landing/raw/imdb"
+DEST_DIR   = dbutils.widgets.get("dest_dir").strip() or f"/Volumes/{CATALOG}/bronze/raw/imdb"
 MANIFEST_PATH = f"{DEST_DIR}/_manifest.json"
 HEADERS    = {"User-Agent": "Mozilla/5.0 (projeto-universitario)"}
 
@@ -164,7 +164,7 @@ def download_file(name):
 if not host_reachable(BASE_URL):
     raise RuntimeError(
         f"{urlparse(BASE_URL).hostname} não é alcançável a partir deste compute (típico da Free Edition). "
-        "Corre download_imdb_all.py no teu computador e carrega os ficheiros para o Volume (landing/raw/imdb).")
+        "Corre download_imdb_all.py no teu computador e carrega os ficheiros para o Volume (bronze/raw/imdb).")
 
 dbutils.fs.mkdirs(DEST_DIR)  # cria a pasta de destino se não existir (idempotente)
 
