@@ -203,7 +203,10 @@ def parse_args():
     p.add_argument("--upload", metavar="RAW_ROOT",
                    help="raiz do Volume, ex.: /Volumes/abd_project/landing/raw (cria imdb/ e movielens/)")
     p.add_argument("--profile", help="profile da Databricks CLI (para o upload)")
-    return p.parse_args()
+    # Em notebook/IDE, sys.argv pertence ao kernel; usar defaults a menos que o
+    # script seja mesmo corrido pela linha de comandos (python download_imdb_movielens.py ...)
+    argv = None if Path(sys.argv[0]).name == "download_imdb_movielens.py" else []
+    return p.parse_args(argv)
 
 
 def main():

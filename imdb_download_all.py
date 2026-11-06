@@ -39,7 +39,7 @@ IMDB_FILES = [
     "title.ratings.tsv.gz",
 ]
 
-dbutils.widgets.text("catalog", "abd_project", "Catálogo")
+dbutils.widgets.text("catalog", "auto", "Catálogo (vazio/auto = detetar o catálogo do utilizador)")
 dbutils.widgets.text("files", "all", "Ficheiros (all ou lista separada por vírgulas)")
 dbutils.widgets.dropdown("overwrite", "nao", ["nao", "sim"], "Forçar novo download")
 dbutils.widgets.text("parallel", "3", "Downloads em paralelo")
