@@ -5,7 +5,7 @@
 # ///
 # MAGIC %md
 # MAGIC # Projeto de grupo: as notas dos filmes dependem de quem as dá?
-# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (arquitetura Medallion) seguindo o CRISP-DM
+# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (Arquitetura Medallion) seguindo o CRISP-DM
 # MAGIC
 # MAGIC **Grupo:** _(nome do grupo)_
 # MAGIC **Elementos:** _(nome 1, nº)_ · _(nome 2, nº)_ · _(nome 3, nº)_ · _(nome 4, nº)_
@@ -34,6 +34,23 @@
 # MAGIC * **Tudo de uma vez:** deixar o widget `etapa = tudo` e fazer **Run all**.
 # MAGIC * **Só uma parte:** escolher a etapa no widget (`tmdb`, `imdb`, `movielens`, `integracao`, `gold`, `analise`) e fazer **Run all**. As células das outras etapas são saltadas.
 # MAGIC * **Como pipeline visual:** criar o Job descrito na secção 6. Cada tarefa do Job corre este mesmo notebook com uma etapa diferente, e o Databricks desenha o grafo das tarefas.
+# MAGIC
+# MAGIC ### Guia de leitura
+# MAGIC
+# MAGIC Nem todas as células têm o mesmo peso. Para perceber o projeto basta ler as células **principais**; as **auxiliares** existem para o notebook ser seguro e apresentável, e começam sempre por um comentário `[Auxiliar]`.
+# MAGIC
+# MAGIC | Tipo | O que fazem | Onde estão |
+# MAGIC |---|---|---|
+# MAGIC | **Principal** | lê os ficheiros, limpa e junta os dados, calcula as tabelas gold e desenha os gráficos (o "Spark" do projeto) | bronze (2), silver (3), gold (4, 4.3), gráficos (5) |
+# MAGIC | **Auxiliar** | verificações no arranque, migração de tabelas antigas, cópias de segurança, constraints, diagramas em HTML/SVG | setup (0), 1.1, 4.2 (desenho e constraints), inventário final |
+# MAGIC
+# MAGIC Cada função tem um nome que diz o que faz (`bronze_imdb`, `silver_tmdb`, `gold_top_movies`...) e é chamada logo a seguir com `if correr("etapa"):`, para se poder correr só uma parte do pipeline.
+# MAGIC
+# MAGIC **Padrões de PySpark que aparecem muitas vezes:**
+# MAGIC * `F.col("x")` refere uma coluna; `withColumn` cria ou substitui uma coluna; `groupBy(...).agg(...)` agrega; `join` junta tabelas.
+# MAGIC * `Window.partitionBy(...).orderBy(...)` faz contas "por grupo sem agrupar" (ex.: ficar com a linha mais recente de cada filme).
+# MAGIC * `lambda p: ...` é uma função pequena sem nome; usamo-la para dizer *como* se lê um ficheiro, deixando a outra função decidir *se* o lê.
+# MAGIC * Nada é calculado até haver uma ação (`count`, `write`, `display`): o Spark é *lazy* e só executa no fim.
 
 # COMMAND ----------
 
@@ -68,6 +85,7 @@ import math
 import uuid
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 from pyspark.sql import Window
@@ -137,7 +155,10 @@ SILVER_TABLES = {"tmdb": ["tmdb_movies", "tmdb_movie_details", "tmdb_movie_genre
                  "imdb": ["imdb_movies", "imdb_movie_genres"],
                  "movielens": ["ml_ratings", "ml_movies", "ml_links", "ml_tags"]}
 GOLD_TABLES = ["ratings_by_decade", "gap_by_genre", "gap_by_language", "gap_by_budget",
-               "movie_rating_gaps", "roi_by_genre", "tags_by_gap", "gap_model_coefficients", "dq_results"]
+               "movie_rating_gaps", "roi_by_genre", "tags_by_gap", "gap_model_coefficients", "dq_results",
+               # perguntas descritivas e de benchmarking (secção 4.3)
+               "genre_catalog", "user_activity", "top_movies", "ratings_over_time", "flag_sensitivity",
+               "movie_rating_shifts", "movie_day_anomalies", "anomaly_participants"]
 # Modelo dimensional (star schema) na gold. A tabela de factos vem primeiro: num reinício é apagada
 # antes das dimensões a que faz referência.
 STAR_TABLES = ["fact_rating", "bridge_movie_genre", "dim_movie", "dim_source", "dim_year", "dim_language", "dim_genre"]
@@ -146,6 +167,8 @@ LANG_NAMES = {"en": "Inglês", "fr": "Francês", "it": "Italiano", "ja": "Japon�
               "sv": "Sueco", "ru": "Russo", "da": "Dinamarquês", "pt": "Português", "nl": "Neerlandês"}
 
 # ------------------------- 2. Verificações do ambiente ------------------------
+# [Auxiliar] Confirma catálogo, schemas, Volume e ficheiros antes de começar. Não é preciso
+# perceber cada função: basta ler a tabela de verificações que aparece no output.
 results = []  # (verificação, estado, detalhe)
 
 
@@ -282,8 +305,10 @@ def with_audit(df, source):
 
 
 def set_comment(full_name, comment):
+    """Guarda uma descrição da tabela no Unity Catalog (aparece no Catalog Explorer)."""
     if comment:
-        spark.sql(f"COMMENT ON TABLE {full_name} IS '{comment.replace(chr(39), chr(39) * 2)}'")
+        texto = comment.replace("'", "''")   # em SQL, uma aspa dentro de um texto escreve-se duas vezes
+        spark.sql(f"COMMENT ON TABLE {full_name} IS '{texto}'")
 
 
 # Colunas de auditoria que todas as tabelas bronze devem ter
@@ -294,6 +319,8 @@ BRONZE_PROPERTIES = {"delta.logRetentionDuration": "interval 90 days",
                      "delta.deletedFileRetentionDuration": "interval 90 days"}
 
 
+# [Auxiliar] As duas funções seguintes tratam da "manutenção" da bronze: guardar o histórico
+# Delta durante 90 dias e atualizar tabelas criadas por versões antigas do notebook.
 def protect_bronze(full):
     props = ", ".join(f"'{k}' = '{v}'" for k, v in BRONZE_PROPERTIES.items())
     try:
@@ -355,7 +382,9 @@ def ingest_source_table(source, key, table, reader, comment):
     """Lê os ficheiros de uma fonte para a bronze, decidindo em função do que já existe:
     * há ficheiros no Volume            -> ingestão incremental;
     * não há ficheiros mas a tabela existe -> mantém o histórico já guardado (sem erro);
-    * não há ficheiros nem tabela       -> erro com instruções."""
+    * não há ficheiros nem tabela       -> erro com instruções.
+    'reader' é uma função que recebe o caminho dos ficheiros e devolve um DataFrame
+    (ex.: lambda p: spark.read.json(p)). Só é chamada se houver ficheiros."""
     full = tbl(BRONZE, table)
     if source_files(source, key):
         ingest_bronze(reader(source_glob(source, key)), table, source, comment)
@@ -434,6 +463,8 @@ def require_tables(layer, names, etapa_anterior):
 
 
 # ------------------------- 4. Pipeline visual ---------------------------------
+# [Auxiliar] Desenho em SVG (texto que o browser transforma em imagem). Só serve para mostrar
+# o estado do pipeline; não é preciso perceber o código de desenho.
 def _layer_state(tables):
     """(nº tabelas existentes, nº esperadas, total de linhas)."""
     existing = [t for t in tables if spark.catalog.tableExists(t)]
@@ -514,6 +545,7 @@ if _fails:
 
 
 # ------------------- 7. Objetos existentes e ação prevista --------------------
+# [Auxiliar] Inventário: para cada tabela diz se já existe e o que o notebook vai fazer com ela.
 def table_info(layer, name):
     """Estado atual de uma tabela: existe?, linhas, última alteração e colunas."""
     full = tbl(layer, name)
@@ -570,6 +602,7 @@ display(spark.createDataFrame(_objects, "camada string, tabela string, existe bo
 
 
 # ------------------- 8. Reinício seguro (opcional) ----------------------------
+# [Auxiliar] Só é usado com o widget reiniciar; faz cópia de segurança antes de apagar.
 def backup_table(full):
     """Copia a tabela para o schema backup antes de a apagar (DEEP CLONE; se não existir, CTAS)."""
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.backup")
@@ -640,64 +673,65 @@ mostrar_pipeline("Estado do pipeline antes de correr")
 # MAGIC
 # MAGIC O diagrama a cores é desenhado pela célula seguinte. Resumo por camada:
 # MAGIC
-# MAGIC |   Camada | Onde fica | O que contém | Regra principal |
-# MAGIC |---|---|---|---|
-# MAGIC | **Fontes** | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
-# MAGIC | **Bronze** | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
-# MAGIC | **Silver** | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
-# MAGIC | **Gold** | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
-# MAGIC | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
+# MAGIC | | Camada | Onde fica | O que contém | Regra principal |
+# MAGIC |---|---|---|---|---|
+# MAGIC | 📥 | **Fontes** | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
+# MAGIC | 🟫 | **Bronze** | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
+# MAGIC | ⬜ | **Silver** | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
+# MAGIC | 🟨 | **Gold** | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
+# MAGIC | 📊 | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
 
 # COMMAND ----------
 
-# DBTITLE 1,Arquitetura
+# DBTITLE 1,Cell 6
+# [Auxiliar] Diagrama em HTML/CSS: cartões coloridos lado a lado. Não é preciso perceber o HTML.
 def mostrar_arquitetura():
     """Diagrama da arquitetura (HTML/CSS: fica visível no notebook e no export HTML)."""
     layers = [
-        ("Fontes", "#e8eef7", "#4c72b0", "Ficheiros descarregados localmente", [
+        ("Fontes", "#e8eef7", "#4c72b0", "", "Ficheiros descarregados localmente", [
             ("IMDb", "title.basics, title.ratings (TSV)"),
             ("TMDB", "listas, géneros, detalhe (JSON)"),
             ("MovieLens", "ratings, movies, links, tags (CSV)")]),
-        ("Bronze", "#f6e7d8", "#a0522d", "Dados brutos com histórico de leituras", [
+        ("Bronze", "#f6e7d8", "#a0522d", "", "Dados brutos com histórico de leituras", [
             ("Volume raw", "/Volumes/&lt;catálogo&gt;/bronze/raw/{imdb, tmdb, movielens}"),
             ("9 tabelas Delta", "tudo em string + _batch_id, _source_file, _ingested_at"),
             ("Regra", "só append de ficheiros novos")]),
-        ("Silver", "#eef0f2", "#6c757d", "Dados limpos e integrados", [
+        ("Silver", "#eef0f2", "#6c757d", "", "Dados limpos e integrados", [
             ("Por fonte", "imdb_movies, tmdb_movie_details, ml_ratings, ml_links, ml_tags…"),
             ("Integrada", "movies_unified (IMDb ⨝ MovieLens ⨝ TMDB)"),
             ("Qualidade", "chaves únicas, tipos, regras dq_results")]),
-        ("Gold", "#fbf3d5", "#b8860b", "Pronta para responder às hipóteses", [
+        ("Gold", "#fbf3d5", "#b8860b", "", "Pronta para responder às hipóteses", [
             ("Comparação", "ratings_by_decade, gap_by_genre"),
             ("Fatores", "gap_by_language, gap_by_budget, roi_by_genre"),
             ("Modelo e texto", "gap_model_coefficients, tags_by_gap")]),
-        ("Consumo", "#e6f4ea", "#2e7d32", "Análise e decisão", [
+        ("Consumo", "#e6f4ea", "#2e7d32", "", "Análise e decisão", [
             ("Gráficos", "10 figuras com intervalos de confiança"),
             ("Modelo", "regressão do gap IMDb − MovieLens"),
             ("Job", "pipeline agendável com tarefas por etapa")]),
     ]
     cards = []
-    for i, (name, bg, border, subtitle, items) in enumerate(layers):
-        rows = "".join(f'<div style="margin:3px 0"><b>{k}</b><br><span style="color:#555;overflow-wrap:anywhere">{v}</span></div>'
+    for i, (name, bg, border, icon, subtitle, items) in enumerate(layers):
+        rows = "".join(f'<div style="margin:6px 0"><b>{k}</b><br><span style="color:#555;overflow-wrap:anywhere">{v}</span></div>'
                        for k, v in items)
         cards.append(
-            f'<div style="flex:1 1 0;min-width:0;background:{bg};border-top:4px solid {border};'
-            f'border-radius:8px;padding:6px 8px;box-shadow:0 1px 3px rgba(0,0,0,.12)">'
-            f'<div style="font-size:13px;font-weight:700;color:{border}">{name}</div>'
-            f'<div style="font-size:10px;font-style:italic;color:#333;margin-bottom:4px">{subtitle}</div>'
-            f'<div style="font-size:10px;color:#222">{rows}</div></div>')
+            f'<div style="flex:1 1 150px;min-width:150px;background:{bg};border-top:6px solid {border};'
+            f'border-radius:10px;padding:10px 12px;box-shadow:0 1px 3px rgba(0,0,0,.12)">'
+            f'<div style="font-size:18px;font-weight:700;color:{border}">{icon} {name}</div>'
+            f'<div style="font-size:12px;font-style:italic;color:#333;margin-bottom:6px">{subtitle}</div>'
+            f'<div style="font-size:12px;color:#222">{rows}</div></div>')
         if i < len(layers) - 1:
-            cards.append('<div style="align-self:center;font-size:14px;color:#888;padding:0">➜</div>')
+            cards.append('<div style="align-self:center;font-size:22px;color:#888;padding:0">➜</div>')
     displayHTML(f"""
     <div style="background:#ffffff;color:#222;font-family:Segoe UI,Helvetica,Arial,sans-serif;padding:12px">
       <div style="font-size:20px;font-weight:700;margin-bottom:2px">Arquitetura Lakehouse · Medallion</div>
       <div style="font-size:13px;color:#555;margin-bottom:12px">
         Unity Catalog: <code>&lt;catálogo&gt;.bronze</code> · <code>.silver</code> · <code>.gold</code>
         &nbsp;|&nbsp; Delta Lake &nbsp;|&nbsp; Spark (serverless)</div>
-      <div style="display:flex;flex-wrap:nowrap;gap:6px;align-items:stretch">{''.join(cards)}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:stretch">{''.join(cards)}</div>
       <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#444;margin-top:12px">
-        <span>🔁 <b>Incremental:</b> ficheiros já lidos não voltam a entrar</span>
-        <span>🛡️ <b>Sem perda de dados:</b> bronze só em append; histórico Delta e <code>RESTORE</code></span>
-        <span>⚙️ <b>Orquestração:</b> Job com tmdb ∥ imdb ∥ movielens → integração → gold → análise</span>
+        <span> <b>Incremental:</b> ficheiros já lidos não voltam a entrar</span>
+        <span> <b>Sem perda de dados:</b> bronze só em append; histórico Delta e <code>RESTORE</code></span>
+        <span> <b>Orquestração:</b> Job com tmdb ∥ imdb ∥ movielens → integração → gold → análise</span>
       </div>
     </div>""")
 
@@ -765,12 +799,20 @@ ML_SCHEMAS = {
 
 
 def bronze_movielens():
-    for name, cols in ML_SCHEMAS.items():
-        # CSV com aspas duplicadas dentro dos títulos e tags, daí escape='"'
-        ingest_source_table("movielens", name, f"ml_{name}",
-                            lambda p, cols=cols, name=name: read_raw_csv(p, cols, escape='"',
-                                                                         multiline=(name in ("movies", "tags"))),
-                            f"MovieLens {name}.csv, valores brutos em string")
+    # CSV com aspas duplicadas dentro dos títulos e tags, daí escape='"'.
+    # movies e tags podem ter texto com quebras de linha, daí multiline=True.
+    ingest_source_table("movielens", "ratings", "ml_ratings",
+                        lambda p: read_raw_csv(p, ML_SCHEMAS["ratings"], escape='"'),
+                        "MovieLens ratings.csv, valores brutos em string")
+    ingest_source_table("movielens", "movies", "ml_movies",
+                        lambda p: read_raw_csv(p, ML_SCHEMAS["movies"], escape='"', multiline=True),
+                        "MovieLens movies.csv, valores brutos em string")
+    ingest_source_table("movielens", "links", "ml_links",
+                        lambda p: read_raw_csv(p, ML_SCHEMAS["links"], escape='"'),
+                        "MovieLens links.csv, valores brutos em string")
+    ingest_source_table("movielens", "tags", "ml_tags",
+                        lambda p: read_raw_csv(p, ML_SCHEMAS["tags"], escape='"', multiline=True),
+                        "MovieLens tags.csv, valores brutos em string")
 
 
 if correr("movielens"):
@@ -1237,7 +1279,7 @@ if correr("gold"):
 # MAGIC * **Dimensões**: `dim_movie` (título, duração, orçamento, receita, escalão de orçamento), `dim_source` (fonte e escala original), `dim_year` (ano e década), `dim_language` (idioma original).
 # MAGIC * **Ponte `bridge_movie_genre`**: um filme tem vários géneros (relação muitos-para-muitos), por isso os géneros ligam-se através de uma tabela ponte para `dim_genre`.
 # MAGIC
-# MAGIC ![As](path) chaves primárias e estrangeiras são registadas no Unity Catalog (**informativas**: documentam o modelo e aparecem no Catalog Explorer, mas não impedem duplicados). A unicidade é garantida pelo `assert_unique` antes da escrita.
+# MAGIC As chaves primárias e estrangeiras são registadas no Unity Catalog (**informativas**: documentam o modelo e aparecem no Catalog Explorer, mas não impedem duplicados). A unicidade é garantida pelo `assert_unique` antes da escrita.
 
 # COMMAND ----------
 
@@ -1256,6 +1298,8 @@ STAR_PKS = {"dim_movie": "movie_key", "dim_source": "source_key", "dim_year": "y
             "dim_language": "language_key", "dim_genre": "genre_key"}
 
 
+# [Auxiliar] Chaves primárias (PK) e estrangeiras (FK) do star schema. No Databricks são
+# informativas: documentam as relações e ajudam o otimizador, mas não bloqueiam dados errados.
 def _try_sql(statement):
     """Constraints são informativas: se o ambiente não as suportar, o pipeline continua."""
     try:
@@ -1339,6 +1383,7 @@ def gold_star():
     add_star_constraints()
 
 
+# [Auxiliar] Desenho do star schema em SVG. O que interessa é a imagem, não o código de desenho.
 def mostrar_star_schema():
     """Diagrama do star schema em SVG: factos ao centro, dimensões à volta, com PK, FK e cardinalidades."""
     W_FACT, W_DIM, ROW, HEAD = 230, 200, 21, 30
@@ -1422,12 +1467,328 @@ def mostrar_star_schema():
     </div>""")
 
 
+# O diagrama não depende de dados: aparece sempre nesta secção, qualquer que seja a etapa
+mostrar_star_schema()
+
 if correr("gold"):
     gold_star()
-    
 
     # Exemplo: a mesma pergunta da Figura 4 respondida diretamente sobre o star schema
-   
+    display(spark.sql(f"""
+        SELECT y.decade, s.source_name,
+               COUNT(*)                 AS n_movies,
+               ROUND(AVG(f.rating_10), 2) AS avg_rating_10
+        FROM {tbl(GOLD, 'fact_rating')} f
+        JOIN {tbl(GOLD, 'dim_source')} s ON f.source_key = s.source_key
+        JOIN {tbl(GOLD, 'dim_year')}   y ON f.year_key   = y.year_key
+        GROUP BY y.decade, s.source_name
+        ORDER BY y.decade, s.source_name"""))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.3 Perguntas descritivas e de benchmarking (comportamento dos utilizadores MovieLens)
+# MAGIC
+# MAGIC | # | Pergunta | Tabela gold | Figura |
+# MAGIC |---|---|---|---|
+# MAGIC | 1 | Que géneros de filmes existem no conjunto de dados? | `genre_catalog` | 11 |
+# MAGIC | 2 | Quantos filmes há por género? | `genre_catalog` | 11 |
+# MAGIC | 3 | Como se distribuem as avaliações por utilizador? | `user_activity` | 12 |
+# MAGIC | 4 | Quais são os filmes com a classificação média mais alta? | `top_movies` | 13 |
+# MAGIC | 5 | Como mudam, ao longo do tempo, o volume, a média e a distribuição dos ratings? | `ratings_over_time` | 14 |
+# MAGIC | 6 | Que utilizadores são sinalizados por picos de atividade, avaliações no mesmo segundo ou concentração em poucas notas? | `user_activity` | 15 |
+# MAGIC | 7 | Como muda a sinalização ao excluir as primeiras 24 horas após a primeira avaliação observada? | `flag_sensitivity` | 15 |
+# MAGIC | 8 | Que filmes registam as maiores subidas ou descidas de classificação média entre períodos? | `movie_rating_shifts` | 16 |
+# MAGIC | 9 | Em quantas avaliações se baseiam essas mudanças? | `movie_rating_shifts` (`n_ratings_total`) | 16 |
+# MAGIC | 10 | Que filmes recebem, no mesmo dia, uma concentração de notas muito altas ou muito baixas face ao seu histórico? | `movie_day_anomalies` | 17 |
+# MAGIC | 11 | Que proporção dos participantes já tinha sido sinalizada por atividade invulgar? | `anomaly_participants` | 17 |
+# MAGIC
+# MAGIC **Regras de sinalização** (constantes na célula seguinte, fáceis de ajustar e justificar):
+# MAGIC * **Pico de atividade:** um dia com pelo menos `SPIKE_MIN_DAY` avaliações **e** acima do percentil 99 de todos os dias-utilizador.
+# MAGIC * **Mesmo segundo:** `SAME_SECOND_MIN` ou mais avaliações com o mesmo timestamp (difícil para um humano).
+# MAGIC * **Concentração em poucas notas:** utilizador com pelo menos `CONC_MIN_RATINGS` avaliações em que a nota mais usada representa `CONC_TOP_SHARE` ou mais do total.
+# MAGIC * **Sem as primeiras 24 horas:** no MovieLens, quem se regista avalia muitos filmes de seguida para receber recomendações. Repetir a sinalização sem essas 24 horas separa esse comportamento normal de atividade realmente invulgar.
+# MAGIC * **Data da sinalização:** primeiro dia de pico, primeiro segundo suspeito, ou dia em que o utilizador atinge `CONC_MIN_RATINGS` avaliações concentradas. Serve para saber se alguém "já tinha sido sinalizado" antes de participar numa anomalia.
+# MAGIC * **Mudança entre períodos:** média de cada filme por períodos de `PERIOD_YEARS` anos (mínimo `MIN_RATINGS_PERIOD` avaliações por período), comparada com o período anterior com dados.
+# MAGIC * **Concentração no mesmo dia:** dia com pelo menos `DAY_MIN_RATINGS` avaliações de um filme em que a proporção de notas ≥ `EXTREME_HIGH` (ou ≤ `EXTREME_LOW`) supera a do resto do histórico do filme em `SHARE_DIFF` ou mais, com z ≥ `Z_MIN` (3), ou seja, uma diferença muito pouco provável por acaso.
+
+# COMMAND ----------
+
+# ---------------- 4.3 Parâmetros das regras (fáceis de ajustar) ----------------
+SPIKE_MIN_DAY      = 50     # avaliações num só dia
+SAME_SECOND_MIN    = 3      # avaliações no mesmo segundo
+CONC_MIN_RATINGS   = 20     # mínimo de avaliações para avaliar a concentração
+CONC_TOP_SHARE     = 0.70   # proporção da nota mais usada
+PERIOD_YEARS       = 5      # tamanho de cada período
+MIN_RATINGS_PERIOD = 10     # avaliações mínimas de um filme por período
+EXTREME_HIGH, EXTREME_LOW = 4.5, 1.0
+DAY_MIN_RATINGS    = 5      # avaliações mínimas de um filme num dia
+HIST_MIN_RATINGS   = 10     # histórico mínimo do filme fora desse dia
+SHARE_DIFF         = 0.40   # diferença mínima de proporção face ao histórico
+Z_MIN              = 3      # z mínimo para considerar a diferença "invulgar"
+BAYES_PRIOR_N      = 20     # "votos fictícios" da média bayesiana no top de filmes
+
+
+def ml_ratings_and_movies():
+    """Lê da silver as avaliações e os filmes do MovieLens (usados em todas as perguntas 4.3)."""
+    require_tables(SILVER, ["ml_ratings", "ml_movies", "movies_unified"], "movielens e integracao")
+    ratings = spark.table(tbl(SILVER, "ml_ratings")).select("user_id", "movie_id", "rating", "rated_at")
+    movies = spark.table(tbl(SILVER, "ml_movies")).select("movie_id", "title", "year", "genres")
+    return ratings, movies
+
+
+# COMMAND ----------
+
+# --------------- Perguntas 1-2: que géneros existem e quantos filmes têm ---------------
+def gold_genre_catalog():
+    _, movies = ml_ratings_and_movies()
+    # explode: um filme com 3 géneros passa a 3 linhas (filme, género)
+    imdb_g = (spark.table(tbl(SILVER, "movies_unified")).select("movie_id", F.explode("genres").alias("genre"))
+              .groupBy("genre").agg(F.countDistinct("movie_id").alias("n_movies_imdb")))
+    ml_g = (movies.select("movie_id", F.explode("genres").alias("genre"))
+            .groupBy("genre").agg(F.countDistinct("movie_id").alias("n_movies_movielens")))
+    # join "full": mantém os géneros que só existem numa das duas fontes (com 0 na outra)
+    catalog = imdb_g.join(ml_g, "genre", "full").fillna(0, ["n_movies_imdb", "n_movies_movielens"])
+    write_delta(catalog, GOLD, "genre_catalog", comment="Géneros existentes e nº de filmes por género (IMDb e MovieLens)")
+
+
+if correr("gold"):
+    gold_genre_catalog()
+
+# COMMAND ----------
+
+# --------------- Perguntas 3, 6 e 7: atividade e sinalização dos utilizadores ---------------
+def user_flags(r, suffix):
+    """Aplica as três regras de sinalização a um conjunto de avaliações r
+    (colunas user_id, movie_id, rating, rated_at). Devolve uma linha por utilizador.
+    O 'suffix' é acrescentado ao nome das colunas (ex.: '_sem_24h') para as distinguir."""
+    r = r.withColumn("rating_date", F.to_date("rated_at"))
+    users = r.groupBy("user_id").agg(F.count("*").alias("n_ratings"))
+
+    # Regra 1, pico de atividade: dias com >= SPIKE_MIN_DAY avaliações e acima do percentil 99
+    per_day = r.groupBy("user_id", "rating_date").agg(F.count("*").alias("n_day"))
+    p99 = per_day.agg(F.percentile_approx("n_day", 0.99)).first()[0] or 0
+    spikes = (per_day.where((F.col("n_day") >= SPIKE_MIN_DAY) & (F.col("n_day") > p99))
+              .groupBy("user_id").agg(F.count("*").alias("spike_days"), F.max("n_day").alias("max_ratings_day"),
+                                      F.min("rating_date").alias("spike_date")))
+
+    # Regra 2, mesmo segundo: SAME_SECOND_MIN ou mais avaliações com o mesmo timestamp
+    same = (r.groupBy("user_id", "rated_at").agg(F.count("*").alias("n_sec"))
+            .where(F.col("n_sec") >= SAME_SECOND_MIN)
+            .groupBy("user_id").agg(F.count("*").alias("same_second_events"),
+                                    F.max("n_sec").alias("max_same_second"),
+                                    F.min(F.to_date("rated_at")).alias("same_second_date")))
+
+    # Regra 3, concentração: que proporção das notas do utilizador é a nota que ele mais usa?
+    w_user = Window.partitionBy("user_id")   # janela = "todas as linhas do mesmo utilizador"
+    conc = (r.groupBy("user_id", "rating").count()
+            .withColumn("share", F.col("count") / F.sum("count").over(w_user))
+            .groupBy("user_id").agg(F.max("share").alias("top_share"), F.count("*").alias("distinct_values")))
+    # data em que o utilizador chega à avaliação nº CONC_MIN_RATINGS (a partir daí a regra 3 aplica-se)
+    nth = (r.withColumn("_rn", F.row_number().over(w_user.orderBy("rated_at", "movie_id")))
+           .where(F.col("_rn") == CONC_MIN_RATINGS).select("user_id", F.col("rating_date").alias("conc_date")))
+
+    # Juntar tudo (left join: quem não tem picos fica com null nessas colunas)
+    out = (users.join(spikes, "user_id", "left").join(same, "user_id", "left")
+           .join(conc, "user_id", "left").join(nth, "user_id", "left")
+           .withColumn("flag_spike", F.col("spike_days").isNotNull())
+           .withColumn("flag_same_second", F.col("same_second_events").isNotNull())
+           .withColumn("flag_concentration", (F.col("n_ratings") >= CONC_MIN_RATINGS) & (F.col("top_share") >= CONC_TOP_SHARE))
+           .withColumn("flag_any", F.col("flag_spike") | F.col("flag_same_second") | F.col("flag_concentration")))
+
+    # Data da primeira sinalização = a mais antiga das três datas, contando só as regras que dispararam.
+    # F.when(...) sem otherwise dá null quando a regra não disparou; F.least ignora os nulls.
+    out = out.withColumn("first_flag_date", F.least(F.when(F.col("flag_spike"), F.col("spike_date")),
+                                                    F.when(F.col("flag_same_second"), F.col("same_second_date")),
+                                                    F.when(F.col("flag_concentration"), F.col("conc_date"))))
+    cols = ["n_ratings", "spike_days", "max_ratings_day", "max_same_second", "top_share", "distinct_values",
+            "flag_spike", "flag_same_second", "flag_concentration", "flag_any", "first_flag_date"]
+    return out.select("user_id", *[F.col(c).alias(c + suffix) for c in cols])
+
+
+def gold_user_activity():
+    ratings, _ = ml_ratings_and_movies()
+
+    # Pergunta 3: estatísticas de cada utilizador
+    stats = ratings.groupBy("user_id").agg(
+        F.round(F.avg("rating"), 3).alias("avg_rating"), F.round(F.stddev("rating"), 3).alias("sd_rating"),
+        F.min("rated_at").alias("first_rating_at"), F.max("rated_at").alias("last_rating_at"),
+        F.countDistinct(F.to_date("rated_at")).alias("active_days"))
+
+    # Pergunta 7: as mesmas avaliações sem as primeiras 24 horas de cada utilizador
+    after_24h = (ratings.join(stats.select("user_id", "first_rating_at"), "user_id")
+                 .where(F.col("rated_at") >= F.col("first_rating_at") + F.expr("INTERVAL 24 HOURS"))
+                 .drop("first_rating_at"))
+
+    # Pergunta 6: sinalização com todas as avaliações (sufixo "") e sem as primeiras 24 h
+    activity = (stats.join(user_flags(ratings, ""), "user_id")
+                .join(user_flags(after_24h, "_sem_24h"), "user_id", "left")
+                .fillna(False, ["flag_spike_sem_24h", "flag_same_second_sem_24h",
+                                "flag_concentration_sem_24h", "flag_any_sem_24h"]))
+    assert_unique(activity, "user_id", "gold.user_activity")
+    activity = write_delta(activity, GOLD, "user_activity",
+                           comment="Atividade e sinalização por utilizador MovieLens (todas as avaliações e sem as primeiras 24 h)")
+
+    # Pergunta 7 (resumo): quantos utilizadores cada regra sinaliza, com e sem as primeiras 24 h
+    flag_cols = [("flag_spike", "Pico de atividade"), ("flag_same_second", "Avaliações no mesmo segundo"),
+                 ("flag_concentration", "Concentração em poucas notas"), ("flag_any", "Qualquer sinalização")]
+    rows = []
+    for col, label in flag_cols:
+        todas = activity.where(F.col(col)).count()
+        sem_24h = activity.where(F.col(col + "_sem_24h")).count()
+        rows.append((label, todas, sem_24h))
+    sens_df = (spark.createDataFrame(rows, "sinalizacao string, utilizadores_todas long, utilizadores_sem_24h long")
+               .withColumn("total_utilizadores", F.lit(activity.count()))
+               .withColumn("variacao_pct", F.round(100 * (F.col("utilizadores_sem_24h") - F.col("utilizadores_todas"))
+                                                    / F.greatest(F.col("utilizadores_todas"), F.lit(1)), 1)))
+    write_delta(sens_df, GOLD, "flag_sensitivity", comment="Utilizadores sinalizados com e sem as primeiras 24 horas")
+
+
+if correr("gold"):
+    gold_user_activity()
+
+# COMMAND ----------
+
+# --------------- Pergunta 4: filmes com a classificação média mais alta ---------------
+def gold_top_movies():
+    ratings, movies = ml_ratings_and_movies()
+    # Média bayesiana: junta BAYES_PRIOR_N "votos fictícios" com a média global.
+    # Um filme com 2 notas de 5 fica perto da média global; um com 500 notas de 4,5 quase não muda.
+    global_mean = ratings.agg(F.avg("rating")).first()[0]
+    top = (ratings.groupBy("movie_id").agg(F.count("*").alias("n_ratings"), F.avg("rating").alias("avg_rating"))
+           .join(movies, "movie_id", "left")
+           .withColumn("bayes_rating", (F.col("n_ratings") * F.col("avg_rating") + BAYES_PRIOR_N * F.lit(global_mean))
+                                       / (F.col("n_ratings") + BAYES_PRIOR_N))
+           .withColumn("rank_bayes", F.row_number().over(Window.orderBy(F.desc("bayes_rating"), F.desc("n_ratings"))))
+           .select("rank_bayes", "movie_id", "title", "year", "n_ratings",
+                   F.round("avg_rating", 3).alias("avg_rating"), F.round("bayes_rating", 3).alias("bayes_rating")))
+    write_delta(top, GOLD, "top_movies", comment="Filmes por nota média MovieLens (simples e bayesiana, que penaliza poucas avaliações)")
+
+
+if correr("gold"):
+    gold_top_movies()
+
+# COMMAND ----------
+
+# --------------- Pergunta 5: evolução mensal do volume, da média e da distribuição ---------------
+def gold_ratings_over_time():
+    ratings, _ = ml_ratings_and_movies()
+    values = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+    # Para cada nota possível, a média de (rating == v) é a proporção de avaliações com essa nota
+    pct_cols = [F.round(F.avg((F.col("rating") == v).cast("int")), 4).alias("pct_" + str(v).replace(".", "_"))
+                for v in values]
+    over_time = (ratings.withColumn("month", F.date_trunc("month", "rated_at").cast("date"))
+                 .groupBy("month")
+                 .agg(F.count("*").alias("n_ratings"), F.round(F.avg("rating"), 3).alias("avg_rating"),
+                      F.round(F.stddev("rating"), 3).alias("sd_rating"),
+                      F.countDistinct("user_id").alias("n_users"), *pct_cols))
+    write_delta(over_time, GOLD, "ratings_over_time", comment="Volume, média e distribuição das notas por mês")
+
+
+if correr("gold"):
+    gold_ratings_over_time()
+
+# COMMAND ----------
+
+# --------------- Perguntas 8-9: maiores subidas e descidas entre períodos ---------------
+def gold_rating_shifts():
+    ratings, movies = ml_ratings_and_movies()
+    # Período de 5 anos: 1997 -> 1995, 2003 -> 2000 (arredonda o ano para baixo ao múltiplo de 5)
+    per_period = (ratings.withColumn("period", (F.floor(F.year("rated_at") / PERIOD_YEARS) * PERIOD_YEARS).cast("int"))
+                  .groupBy("movie_id", "period").agg(F.count("*").alias("n"), F.avg("rating").alias("avg"))
+                  .where(F.col("n") >= MIN_RATINGS_PERIOD))
+    # lag = valor da linha anterior na janela, ou seja, o período anterior do mesmo filme
+    w_mov = Window.partitionBy("movie_id").orderBy("period")
+    shifts = (per_period
+              .withColumn("prev_period", F.lag("period").over(w_mov))
+              .withColumn("prev_avg", F.lag("avg").over(w_mov))
+              .withColumn("prev_n", F.lag("n").over(w_mov))
+              .where(F.col("prev_period").isNotNull())          # o primeiro período não tem com que comparar
+              .join(movies.select("movie_id", "title"), "movie_id", "left")
+              .select("movie_id", "title",
+                      F.concat_ws("-", "prev_period", (F.col("prev_period") + PERIOD_YEARS - 1).cast("string")).alias("periodo_anterior"),
+                      F.concat_ws("-", "period", (F.col("period") + PERIOD_YEARS - 1).cast("string")).alias("periodo_atual"),
+                      F.round("prev_avg", 3).alias("avg_anterior"), F.round("avg", 3).alias("avg_atual"),
+                      F.round(F.col("avg") - F.col("prev_avg"), 3).alias("variacao"),
+                      F.col("prev_n").alias("n_anterior"), F.col("n").alias("n_atual"),
+                      (F.col("prev_n") + F.col("n")).alias("n_ratings_total")))     # pergunta 9
+    write_delta(shifts, GOLD, "movie_rating_shifts",
+                comment=f"Variação da nota média de cada filme entre períodos de {PERIOD_YEARS} anos (mín. {MIN_RATINGS_PERIOD} avaliações por período)")
+
+
+if correr("gold"):
+    gold_rating_shifts()
+
+# COMMAND ----------
+
+# --------------- Perguntas 10-11: notas extremas concentradas num só dia ---------------
+def z_score_proporcao(share_day, share_hist):
+    """Quantos desvios-padrão a proporção do dia está acima da proporção habitual do filme.
+    Fórmula do teste a uma proporção: z = (p_dia - p_hist) / raiz(p_hist * (1 - p_hist) / n_dia).
+    p_hist é limitado a [0,01; 0,99] para nunca dividir por zero."""
+    p = F.greatest(F.least(share_hist, F.lit(0.99)), F.lit(0.01))
+    return (share_day - share_hist) / F.sqrt(p * (1 - p) / F.col("n_day"))
+
+
+def gold_day_anomalies():
+    ratings, movies = ml_ratings_and_movies()
+    daily = (ratings.withColumn("rating_date", F.to_date("rated_at"))
+             .withColumn("is_high", (F.col("rating") >= EXTREME_HIGH).cast("int"))   # 1 se nota muito alta
+             .withColumn("is_low", (F.col("rating") <= EXTREME_LOW).cast("int")))    # 1 se nota muito baixa
+
+    # Contagens por filme e dia, e totais por filme
+    md = daily.groupBy("movie_id", "rating_date").agg(F.count("*").alias("n_day"), F.sum("is_high").alias("high_day"),
+                                                     F.sum("is_low").alias("low_day"))
+    tot = daily.groupBy("movie_id").agg(F.count("*").alias("n_tot"), F.sum("is_high").alias("high_tot"),
+                                        F.sum("is_low").alias("low_tot"))
+
+    # Pergunta 10: comparar a proporção de notas extremas no dia com a do resto do histórico
+    # ("histórico" = todas as avaliações do filme menos as desse dia)
+    anomalies = (md.join(tot, "movie_id")
+                 .withColumn("n_hist", F.col("n_tot") - F.col("n_day"))
+                 .where((F.col("n_day") >= DAY_MIN_RATINGS) & (F.col("n_hist") >= HIST_MIN_RATINGS))
+                 .withColumn("share_high_day", F.col("high_day") / F.col("n_day"))
+                 .withColumn("share_high_hist", (F.col("high_tot") - F.col("high_day")) / F.col("n_hist"))
+                 .withColumn("share_low_day", F.col("low_day") / F.col("n_day"))
+                 .withColumn("share_low_hist", (F.col("low_tot") - F.col("low_day")) / F.col("n_hist"))
+                 .withColumn("z_high", z_score_proporcao(F.col("share_high_day"), F.col("share_high_hist")))
+                 .withColumn("z_low", z_score_proporcao(F.col("share_low_day"), F.col("share_low_hist"))))
+    # Anomalia = diferença grande (>= SHARE_DIFF) E pouco provável por acaso (z >= Z_MIN)
+    high = (F.col("share_high_day") - F.col("share_high_hist") >= SHARE_DIFF) & (F.col("z_high") >= Z_MIN)
+    low = (F.col("share_low_day") - F.col("share_low_hist") >= SHARE_DIFF) & (F.col("z_low") >= Z_MIN)
+    anomalies = (anomalies.withColumn("tipo", F.when(high, "notas muito altas").when(low, "notas muito baixas"))
+                 .where(F.col("tipo").isNotNull()))
+
+    # Pergunta 11: quem avaliou esse filme nesse dia, e se já estava sinalizado antes desse dia
+    flags = spark.table(tbl(GOLD, "user_activity")).select("user_id", "first_flag_date")
+    participants = (daily.join(F.broadcast(anomalies.select("movie_id", "rating_date", "tipo")), ["movie_id", "rating_date"])
+                    .join(flags, "user_id", "left")
+                    .withColumn("ja_sinalizado", F.coalesce(F.col("first_flag_date") < F.col("rating_date"), F.lit(False))))
+    per_anomaly = participants.groupBy("movie_id", "rating_date").agg(
+        F.countDistinct("user_id").alias("n_participants"),
+        F.countDistinct(F.when(F.col("ja_sinalizado"), F.col("user_id"))).alias("n_ja_sinalizados"))
+    anomalies_out = (anomalies.join(per_anomaly, ["movie_id", "rating_date"], "left")
+                     .join(movies.select("movie_id", "title"), "movie_id", "left")
+                     .select("movie_id", "title", "rating_date", "tipo", "n_day", "n_hist",
+                             F.round("share_high_day", 3).alias("share_high_day"), F.round("share_high_hist", 3).alias("share_high_hist"),
+                             F.round("share_low_day", 3).alias("share_low_day"), F.round("share_low_hist", 3).alias("share_low_hist"),
+                             F.round(F.greatest("z_high", "z_low"), 2).alias("z"), "n_participants", "n_ja_sinalizados"))
+    write_delta(anomalies_out, GOLD, "movie_day_anomalies",
+                comment="Dias com concentração anormal de notas muito altas ou muito baixas num filme, face ao seu histórico")
+
+    # Uma linha por participante: já estava sinalizado antes da sua PRIMEIRA participação?
+    part_users = (participants.groupBy("user_id")
+                  .agg(F.min("rating_date").alias("primeira_participacao"),
+                       F.first("first_flag_date", ignorenulls=True).alias("first_flag_date"),
+                       F.countDistinct("movie_id", "rating_date").alias("n_anomalias"))
+                  .withColumn("ja_sinalizado", F.col("first_flag_date") < F.col("primeira_participacao"))
+                  .fillna(False, ["ja_sinalizado"]))
+    write_delta(part_users, GOLD, "anomaly_participants",
+                comment="Utilizadores que participaram em anomalias diárias e se já estavam sinalizados antes da primeira participação")
+
+
+if correr("gold"):
+    gold_day_anomalies()
 
 # COMMAND ----------
 
@@ -1763,6 +2124,166 @@ if ANALISE:
                        int(_detail.get("numFiles") or 0), round((_detail.get("sizeInBytes") or 0) / 1024 / 1024, 2)))
     display(spark.createDataFrame(layout, "camada string, tabela string, clustering string, particoes string, "
                                           "ficheiros long, tamanho_mb double"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.12 Respostas às perguntas descritivas e de benchmarking
+# MAGIC Cada figura responde a uma ou mais perguntas da tabela da secção 4.3.
+
+# COMMAND ----------
+
+if ANALISE:
+    # Perguntas 1 e 2: géneros e nº de filmes por género
+    gc = spark.table(tbl(GOLD, "genre_catalog")).toPandas()
+    gc = gc.sort_values("n_movies_movielens")
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.3 * len(gc))))
+    y = np.arange(len(gc))
+    ax.barh(y - 0.2, gc["n_movies_movielens"], 0.4, label="MovieLens", color=SOURCE_COLORS["MovieLens"])
+    ax.barh(y + 0.2, gc["n_movies_imdb"], 0.4, label="IMDb (filmes integrados)", color=SOURCE_COLORS["IMDb"])
+    ax.set_yticks(y, gc["genre"])
+    ax.set_xlabel("Nº de filmes (um filme pode ter vários géneros)")
+    ax.set_title(f"Figura 11. {len(gc)} géneros e nº de filmes por género")
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+
+# COMMAND ----------
+
+if ANALISE:
+    # Pergunta 3: distribuição das avaliações por utilizador
+    ua = spark.table(tbl(GOLD, "user_activity")).select("n_ratings", "avg_rating", "active_days").toPandas()
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    axes[0].hist(ua["n_ratings"], bins=np.logspace(np.log10(max(ua["n_ratings"].min(), 1)),
+                                                   np.log10(ua["n_ratings"].max() + 1), 30), color="#4c72b0")
+    axes[0].set_xscale("log")
+    axes[0].axvline(ua["n_ratings"].median(), color="red", ls="--", label=f"mediana = {ua['n_ratings'].median():.0f}")
+    axes[0].set_xlabel("Avaliações por utilizador (escala log)")
+    axes[0].set_ylabel("Nº de utilizadores")
+    axes[0].set_title("Figura 12a. Quantas avaliações faz cada utilizador")
+    axes[0].legend()
+    axes[1].hist(ua["avg_rating"], bins=np.arange(0.5, 5.25, 0.125), color=SOURCE_COLORS["MovieLens"])
+    axes[1].set_xlabel("Nota média do utilizador (0.5 a 5)")
+    axes[1].set_title("Figura 12b. Nota média por utilizador")
+    fig.tight_layout()
+    plt.show()
+    top10 = ua["n_ratings"].sort_values(ascending=False)
+    print(f"{len(ua):,} utilizadores | mediana {ua['n_ratings'].median():.0f} avaliações | "
+          f"os 10% mais ativos fazem {100 * top10.head(max(1, len(ua) // 10)).sum() / top10.sum():.0f}% das avaliações")
+
+# COMMAND ----------
+
+if ANALISE:
+    # Pergunta 4: filmes com a classificação média mais alta
+    tm = spark.table(tbl(GOLD, "top_movies")).where("rank_bayes <= 15").orderBy(F.desc("rank_bayes")).toPandas()
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    bars = ax.barh(tm["title"].str.slice(0, 45), tm["bayes_rating"], color="#55a868")
+    ax.bar_label(bars, labels=[f"{b:.2f}  (n={n})" for b, n in zip(tm["bayes_rating"], tm["n_ratings"])],
+                 padding=3, fontsize=8)
+    ax.set_xlim(tm["bayes_rating"].min() - 0.3, 5.3)
+    ax.set_xlabel("Nota média bayesiana (0.5 a 5)")
+    ax.set_title("Figura 13. Top 15 filmes por nota média (bayesiana, penaliza poucas avaliações)")
+    fig.tight_layout()
+    plt.show()
+
+# COMMAND ----------
+
+if ANALISE:
+    # Pergunta 5: volume, média e distribuição ao longo do tempo
+    ot = spark.table(tbl(GOLD, "ratings_over_time")).orderBy("month").toPandas()
+    ot["month"] = pd.to_datetime(ot["month"])
+    pct_cols = [c for c in ot.columns if c.startswith("pct_")]
+    yearly = ot.assign(year=ot["month"].dt.year)
+    yearly = (yearly[pct_cols].mul(yearly["n_ratings"], axis=0).groupby(yearly["year"]).sum()
+              .div(yearly.groupby("year")["n_ratings"].sum(), axis=0))
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    axes[0].bar(ot["month"], ot["n_ratings"], width=25, color="#cccccc", label="avaliações por mês")
+    axes[0].set_ylabel("Nº de avaliações")
+    ax2 = axes[0].twinx()
+    ax2.plot(ot["month"], ot["avg_rating"].rolling(6, min_periods=1).mean(), color="#c44e52", label="média (móvel 6 meses)")
+    ax2.set_ylabel("Nota média", color="#c44e52")
+    ax2.grid(False)
+    axes[0].set_title("Figura 14a. Volume mensal e nota média ao longo do tempo")
+    axes[1].stackplot(yearly.index, yearly.T.values, labels=[c.replace("pct_", "").replace("_", ".") for c in pct_cols],
+                      colors=plt.cm.RdYlGn(np.linspace(0, 1, len(pct_cols))))
+    axes[1].set_ylim(0, 1)
+    axes[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+    axes[1].set_ylabel("Proporção das avaliações")
+    axes[1].set_title("Figura 14b. Distribuição das notas por ano")
+    axes[1].legend(title="Nota", ncol=10, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.08))
+    fig.tight_layout()
+    plt.show()
+
+# COMMAND ----------
+
+if ANALISE:
+    # Perguntas 6 e 7: utilizadores sinalizados, com e sem as primeiras 24 horas
+    fs = spark.table(tbl(GOLD, "flag_sensitivity")).toPandas()
+    x = np.arange(len(fs))
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    b1 = ax.bar(x - 0.2, fs["utilizadores_todas"], 0.4, label="todas as avaliações", color="#c44e52")
+    b2 = ax.bar(x + 0.2, fs["utilizadores_sem_24h"], 0.4, label="sem as primeiras 24 h", color="#4c72b0")
+    ax.bar_label(b1, padding=2, fontsize=8)
+    ax.bar_label(b2, padding=2, fontsize=8)
+    ax.set_xticks(x, fs["sinalizacao"], fontsize=9)
+    ax.set_ylabel("Nº de utilizadores sinalizados")
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_title(f"Figura 15. Sinalização de utilizadores (total: {int(fs['total_utilizadores'].iloc[0]):,})")
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+    display(spark.table(tbl(GOLD, "user_activity")).where("flag_any")
+            .select("user_id", "n_ratings", "max_ratings_day", "max_same_second", "top_share",
+                    "flag_spike", "flag_same_second", "flag_concentration", "flag_any_sem_24h", "first_flag_date")
+            .orderBy(F.desc("n_ratings")))
+    print("Se a sinalização cai muito sem as primeiras 24 h, os picos eram sobretudo o registo inicial no MovieLens.")
+
+# COMMAND ----------
+
+if ANALISE:
+    # Perguntas 8 e 9: maiores subidas e descidas entre períodos, e em quantas avaliações se baseiam
+    sh = spark.table(tbl(GOLD, "movie_rating_shifts"))
+    best = pd.concat([sh.orderBy(F.desc("variacao")).limit(8).toPandas(),
+                      sh.orderBy("variacao").limit(8).toPandas()]).drop_duplicates("movie_id").sort_values("variacao")
+    if len(best):
+        labels = (best["title"].str.slice(0, 35) + "  " + best["periodo_anterior"] + " → " + best["periodo_atual"])
+        fig, ax = plt.subplots(figsize=(11, 0.4 * len(best) + 1.5))
+        bars = ax.barh(labels, best["variacao"], color=np.where(best["variacao"] > 0, "#55a868", "#c44e52"))
+        ax.bar_label(bars, labels=[f"n = {a} + {b}" for a, b in zip(best["n_anterior"], best["n_atual"])],
+                     padding=3, fontsize=8)
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_xlim(min(best["variacao"].min(), 0) - 0.8, max(best["variacao"].max(), 0) + 0.8)
+        ax.set_xlabel("Variação da nota média entre períodos (pontos, escala 0.5-5)")
+        ax.set_title(f"Figura 16. Maiores subidas e descidas (períodos de {PERIOD_YEARS} anos; n = avaliações em cada período)")
+        fig.tight_layout()
+        plt.show()
+    else:
+        print("Nenhum filme tem avaliações suficientes em dois períodos; baixar MIN_RATINGS_PERIOD ou PERIOD_YEARS.")
+
+# COMMAND ----------
+
+if ANALISE:
+    # Perguntas 10 e 11: concentrações no mesmo dia e participantes já sinalizados
+    an = spark.table(tbl(GOLD, "movie_day_anomalies")).orderBy(F.desc("z"))
+    display(an.limit(20))
+    pu = spark.table(tbl(GOLD, "anomaly_participants")).toPandas()
+    n_an = an.count()
+    if len(pu):
+        prev = int(pu["ja_sinalizado"].sum())
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        by_type = an.groupBy("tipo").count().toPandas()
+        axes[0].bar(by_type["tipo"], by_type["count"], color=["#55a868" if "altas" in t else "#c44e52" for t in by_type["tipo"]])
+        axes[0].set_ylabel("Nº de dias-filme anómalos")
+        axes[0].set_title(f"Figura 17a. {n_an} concentrações anormais no mesmo dia")
+        axes[1].bar(["já sinalizados", "não sinalizados"], [prev, len(pu) - prev], color=["#c44e52", "#999999"])
+        axes[1].set_title(f"Figura 17b. Participantes: {100 * prev / len(pu):.1f}% já estavam sinalizados")
+        axes[1].set_ylabel("Nº de utilizadores")
+        fig.tight_layout()
+        plt.show()
+        print(f"{len(pu):,} utilizadores participaram em {n_an} anomalias; {prev:,} ({100 * prev / len(pu):.1f}%) "
+              "já tinham sido sinalizados por atividade invulgar antes da primeira participação.")
+    else:
+        print("Não foram encontradas concentrações anormais com os limiares atuais.")
 
 # COMMAND ----------
 
