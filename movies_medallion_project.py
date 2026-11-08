@@ -675,11 +675,11 @@ mostrar_pipeline("Estado do pipeline antes de correr")
 # MAGIC
 # MAGIC | | Camada | Onde fica | O que contém | Regra principal |
 # MAGIC |---|---|---|---|---|
-# MAGIC | 📥 | **Fontes** | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
-# MAGIC | 🟫 | **Bronze** | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
-# MAGIC | ⬜ | **Silver** | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
-# MAGIC | 🟨 | **Gold** | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
-# MAGIC | 📊 | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
+# MAGIC | **Fontes**  | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
+# MAGIC | **Bronze**  | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
+# MAGIC | **Silver**  | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
+# MAGIC | **Gold**    | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
+# MAGIC | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
 
 # COMMAND ----------
 
