@@ -4,20 +4,18 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # Projeto de grupo: as notas dos filmes dependem de quem as dá?
-# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (Arquitetura Medallion) seguindo o CRISP-DM
+# MAGIC # Projeto de grupo: Databricks, exploração de uma plataforma para explorarar a Base de dados MovieLens e fazer joins com outras.
+# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (arquitetura Medallion) seguindo o CRISP-DM
 # MAGIC
 # MAGIC **Grupo:** _(nome do grupo)_
-# MAGIC **Elementos:** _(nome 1, nº)_ · _(nome 2, nº)_ · _(nome 3, nº)_ · _(nome 4, nº)_
+# MAGIC **Elementos:** _(Francisco Monteiro, nº 20251694)_ · _( José Grave, nº 20251843)_ · _(Luis Pousada, nº 20250979)_ · _(Tiago Felgueira nº 20242047)_
 # MAGIC **Curso:** Analyzing Big Data 2026, NOVA IMS  |  **Data de entrega:** 16/11/2026
-# MAGIC
-# MAGIC ---
 # MAGIC
 # MAGIC ### Como este notebook está organizado
 # MAGIC
 # MAGIC Usamos duas ideias que se complementam:
 # MAGIC
-# MAGIC * a **arquitetura Medallion** organiza os **dados** (bronze = bruto com histórico, silver = limpo e integrado, gold = pronto para análise);
+# MAGIC * a **Arquitetura Medallion** organiza os **dados** (bronze = bruto com histórico, silver = limpo e integrado, gold = pronto para análise);
 # MAGIC * o **CRISP-DM** organiza o **processo de análise** (perceber o problema, perceber os dados, preparar, modelar, avaliar, pôr em produção).
 # MAGIC
 # MAGIC | Fase CRISP-DM | Secção | Camada Medallion |
@@ -85,7 +83,7 @@ import math
 import uuid
 
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 import numpy as np
 import pandas as pd
 from pyspark.sql import Window
@@ -100,10 +98,12 @@ dbutils.widgets.dropdown("reiniciar", "nao", ["nao", "silver_gold", "tudo_com_ba
 dbutils.widgets.text("min_imdb_votes", "1000", "Mín. votos IMDb")
 dbutils.widgets.text("min_ml_ratings", "10", "Mín. avaliações MovieLens")
 dbutils.widgets.text("min_tmdb_votes", "20", "Mín. votos TMDB")
+dbutils.widgets.dropdown("publicar_sql", "sim", ["sim", "nao"], "Publicar consultas e dashboard")
 
 CATALOG        = dbutils.widgets.get("catalog").strip()
 ETAPA          = dbutils.widgets.get("etapa")
 REINICIAR      = dbutils.widgets.get("reiniciar")   # nao | silver_gold | tudo_com_backup
+PUBLICAR_SQL   = dbutils.widgets.get("publicar_sql") == "sim"   # secção 6.1
 
 
 def _int_widget(name, default):
@@ -675,15 +675,14 @@ mostrar_pipeline("Estado do pipeline antes de correr")
 # MAGIC
 # MAGIC | | Camada | Onde fica | O que contém | Regra principal |
 # MAGIC |---|---|---|---|---|
-# MAGIC | **Fontes**  | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
-# MAGIC | **Bronze**  | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
-# MAGIC | **Silver**  | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
-# MAGIC | **Gold**    | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
-# MAGIC | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
+# MAGIC |  **Fontes** | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
+# MAGIC |  **Bronze** | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
+# MAGIC |  **Silver** | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
+# MAGIC |  **Gold** | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
+# MAGIC |  **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 6
 # [Auxiliar] Diagrama em HTML/CSS: cartões coloridos lado a lado. Não é preciso perceber o HTML.
 def mostrar_arquitetura():
     """Diagrama da arquitetura (HTML/CSS: fica visível no notebook e no export HTML)."""
@@ -845,7 +844,13 @@ if correr("analise"):
         batches.plot.barh(ax=ax, colormap="tab10", width=0.8)   # uma barra por lote
         ax.set_xscale("log")
         ax.set_xlim(left=0.5)
-        ax.set_xlabel("Linhas (escala logarítmica)")
+        # Eixo em milhões: 1 000 000 -> 1M, 100 000 -> 0,1M (abaixo de 1000 mostra o número normal)
+        def em_milhoes(x, _):
+            if x < 1000:
+                return f"{x:.0f}"
+            return f"{x / 1e6:g}M".replace(".", ",")
+        ax.xaxis.set_major_formatter(FuncFormatter(em_milhoes))
+        ax.set_xlabel("Linhas, em milhões (M), escala logarítmica")
         ax.set_ylabel("")
         ax.set_title("Figura 1. Linhas por tabela bronze e por lote de ingestão")
         ax.legend(title="Lote", fontsize=8, loc="lower right")
@@ -2312,6 +2317,194 @@ if ANALISE:
 # MAGIC Em alternativa, o ficheiro `job_filmes_medallion.yml` (entregue com este notebook) tem a definição do Job em código: no Job, menu **⋮ → Edit as YAML** (ou *View as code*) e colar.
 # MAGIC
 # MAGIC **Num Job o widget `reiniciar` fica sempre em `nao`.** O notebook recusa um reinício fora de `etapa = tudo`, porque apagaria tabelas enquanto outras tarefas as leem. Como a bronze é incremental e as outras camadas são reconstruídas, o Job pode correr quantas vezes for preciso sem duplicar nem perder dados.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.1 Consultas SQL guardadas e dashboard (Databricks SQL)
+# MAGIC
+# MAGIC Os gráficos deste notebook servem a análise. Para quem consome os resultados (gestão, outras equipas) o habitual é um **dashboard** alimentado por **consultas SQL guardadas**, que leem só a camada gold.
+# MAGIC
+# MAGIC | # | Consulta | Responde a | Tabela gold |
+# MAGIC |---|---|---|---|
+# MAGIC | Q1 | Nota média por fonte e década | H1, H5 | `ratings_by_decade` |
+# MAGIC | Q2 | Diferença IMDb − MovieLens por género | H2 | `gap_by_genre` |
+# MAGIC | Q3 | Diferença por idioma original | H3 | `gap_by_language` |
+# MAGIC | Q4 | Consenso por escalão de orçamento | H4 | `gap_by_budget` |
+# MAGIC | Q5 | Filmes onde as fontes mais discordam | H1 | `movie_rating_gaps` |
+# MAGIC | Q6 | Nota média por fonte e década, no star schema | 4.2 | `fact_rating` + dimensões |
+# MAGIC | Q7 | Evolução mensal das avaliações | 4.3, pergunta 5 | `ratings_over_time` |
+# MAGIC | Q8 | Utilizadores sinalizados, com e sem as primeiras 24 h | 4.3, perguntas 6-7 | `flag_sensitivity` |
+# MAGIC | Q9 | Qualidade dos dados na última execução | secção 3 | `dq_results` |
+# MAGIC
+# MAGIC **O que as células seguintes fazem (etapa `analise`):**
+# MAGIC 1. Correm as 9 consultas e mostram o resultado (funciona sempre).
+# MAGIC 2. Com o widget `publicar_sql = sim`, guardam-nas em **Queries** e criam (ou atualizam) o dashboard **Filmes: as notas dependem de quem as dá?** em **Dashboards**, na pasta `abd_project_sql` do vosso utilizador. Antes de criar, verificam se já existem com o mesmo nome: se sim, atualizam em vez de duplicar.
+# MAGIC
+# MAGIC Se a publicação automática falhar (permissões, versão da biblioteca), o notebook avisa e continua; nesse caso basta seguir o guia `queries_e_dashboard.md`, que faz o mesmo à mão.
+
+# COMMAND ----------
+
+def gold_tbl(name):
+    return tbl(GOLD, name)
+
+
+
+SQL_QUERIES = {
+    "Q1 - Nota média por fonte e década": f"""
+        SELECT decade, n_movies, avg_imdb, avg_ml, avg_tmdb
+        FROM {gold_tbl('ratings_by_decade')}
+        ORDER BY decade""",
+    "Q2 - Diferença IMDb-MovieLens por género": f"""
+        SELECT genre, n_movies, avg_gap, sd_gap, avg_imdb, avg_ml
+        FROM {gold_tbl('gap_by_genre')}
+        ORDER BY avg_gap DESC""",
+    "Q3 - Diferença por idioma original": f"""
+        SELECT original_language, n_movies, avg_gap_ml, avg_gap_tmdb
+        FROM {gold_tbl('gap_by_language')}
+        ORDER BY n_movies DESC
+        LIMIT 15""",
+    "Q4 - Consenso por escalão de orçamento": f"""
+        SELECT budget_band, n_movies, avg_gap, avg_abs_gap
+        FROM {gold_tbl('gap_by_budget')}
+        ORDER BY budget_band""",
+    "Q5 - Filmes onde as fontes mais discordam": f"""
+        SELECT title, start_year, imdb_rating, ml_rating_10, gap_imdb_ml, imdb_votes, ml_num_ratings
+        FROM {gold_tbl('movie_rating_gaps')}
+        ORDER BY abs_gap DESC
+        LIMIT 20""",
+    "Q6 - Star schema: nota média por fonte e década": f"""
+        SELECT y.decade, s.source_name, ROUND(AVG(f.rating_10), 2) AS nota_media, COUNT(*) AS n
+        FROM {gold_tbl('fact_rating')} f
+        JOIN {gold_tbl('dim_source')} s ON f.source_key = s.source_key
+        JOIN {gold_tbl('dim_year')}   y ON f.year_key   = y.year_key
+        GROUP BY y.decade, s.source_name
+        ORDER BY y.decade, s.source_name""",
+    "Q7 - Evolução mensal das avaliações": f"""
+        SELECT month, n_ratings, avg_rating, n_users
+        FROM {gold_tbl('ratings_over_time')}
+        ORDER BY month""",
+    "Q8 - Utilizadores sinalizados com e sem 24h": f"""
+        SELECT sinalizacao, utilizadores_todas, utilizadores_sem_24h, variacao_pct
+        FROM {gold_tbl('flag_sensitivity')}""",
+    "Q9 - Qualidade dos dados na última execução": f"""
+        SELECT tabela, regra, linhas, violacoes, pct_violacoes, _checked_at
+        FROM {gold_tbl('dq_results')}
+        WHERE _batch_id = (SELECT MAX(_batch_id) FROM {gold_tbl('dq_results')})
+        ORDER BY pct_violacoes DESC""",
+}
+
+if ANALISE:
+    for _name, _sql in SQL_QUERIES.items():
+        print(_name)
+        try:
+            display(spark.sql(_sql))
+        except Exception as e:   
+            print(f"  [aviso] não foi possível correr: {type(e).__name__}")
+
+# COMMAND ----------
+
+# [Auxiliar] Publicação das consultas e do dashboard no Databricks SQL, através do Databricks SDK
+# (biblioteca Python oficial, já instalada no Databricks e autenticada com o vosso utilizador).
+# O que interessa perceber: cada widget do dashboard = uma consulta + um tipo de gráfico + as colunas dos eixos.
+import json
+
+DASHBOARD_NAME = "Filmes: as notas dependem de quem as dá?"
+
+# (consulta, tipo de gráfico, coluna do eixo X, colunas do eixo Y, posição x, posição y, largura, altura)
+# A grelha do dashboard tem 6 colunas de largura.
+DASHBOARD_WIDGETS = [
+    ("Q1 - Nota média por fonte e década",         "line",  "decade",            ["avg_imdb", "avg_ml", "avg_tmdb"], 0, 0, 3, 6),
+    ("Q2 - Diferença IMDb-MovieLens por género",   "bar",   "genre",             ["avg_gap"],                        3, 0, 3, 6),
+    ("Q3 - Diferença por idioma original",         "bar",   "original_language", ["avg_gap_ml"],                     0, 6, 3, 6),
+    ("Q4 - Consenso por escalão de orçamento",     "bar",   "budget_band",       ["avg_abs_gap"],                    3, 6, 3, 6),
+    ("Q7 - Evolução mensal das avaliações",        "line",  "month",             ["n_ratings"],                      0, 12, 3, 6),
+    ("Q8 - Utilizadores sinalizados com e sem 24h", "bar",  "sinalizacao",       ["utilizadores_todas", "utilizadores_sem_24h"], 3, 12, 3, 6),
+    ("Q5 - Filmes onde as fontes mais discordam",  "table", None, ["title", "start_year", "imdb_rating", "ml_rating_10", "gap_imdb_ml"], 0, 18, 6, 7),
+    ("Q9 - Qualidade dos dados na última execução", "table", None, ["tabela", "regra", "linhas", "violacoes", "pct_violacoes"], 0, 25, 6, 6),
+]
+
+
+def dashboard_json():
+    """Constrói a definição do dashboard (formato JSON dos AI/BI Dashboards)."""
+    ids = {name: f"q{i + 1}" for i, name in enumerate(SQL_QUERIES)}
+    datasets = [{"name": ids[n], "displayName": n, "queryLines": [" ".join(q.split())]} for n, q in SQL_QUERIES.items()]
+    layout = []
+    for i, (qname, kind, x_col, y_cols, px, py, w, h) in enumerate(DASHBOARD_WIDGETS):
+        cols = ([x_col] if x_col else []) + y_cols
+        query = {"name": "main_query",
+                 "query": {"datasetName": ids[qname], "disaggregated": True,
+                           "fields": [{"name": c, "expression": f"`{c}`"} for c in cols]}}
+        if kind == "table":
+            spec = {"version": 1, "widgetType": "table",
+                    "encodings": {"columns": [{"fieldName": c, "displayName": c} for c in y_cols]}}
+        else:
+            x_scale = "temporal" if x_col == "month" else ("quantitative" if x_col == "decade" else "categorical")
+            spec = {"version": 3, "widgetType": kind,
+                    "encodings": {"x": {"fieldName": x_col, "scale": {"type": x_scale}, "displayName": x_col},
+                                  "y": {"fields": [{"fieldName": c, "displayName": c} for c in y_cols],
+                                        "scale": {"type": "quantitative"}}}}
+        spec["frame"] = {"showTitle": True, "title": qname}
+        layout.append({"widget": {"name": f"w{i + 1}", "queries": [query], "spec": spec},
+                       "position": {"x": px, "y": py, "width": w, "height": h}})
+    return json.dumps({"datasets": datasets,
+                       "pages": [{"name": "principal", "displayName": "Resultados", "layout": layout}]})
+
+
+def publicar_sql():
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service import sql as dbsql
+    w = WorkspaceClient()
+
+    # 1) Warehouse SQL (na Free Edition há um: "Serverless Starter Warehouse")
+    warehouses = list(w.warehouses.list())
+    if not warehouses:
+        raise RuntimeError("não há nenhum SQL Warehouse disponível")
+    wh = next((x for x in warehouses if "starter" in (x.name or "").lower()), warehouses[0])
+
+    # 2) Pasta de destino no workspace do utilizador
+    folder = f"/Users/{w.current_user.me().user_name}/abd_project_sql"
+    w.workspace.mkdirs(folder)
+
+    # 3) Consultas guardadas: verificar se já existe uma com o mesmo nome; se sim atualizar, senão criar
+    existing = {q.display_name: q.id for q in w.queries.list()}
+    for name, sql_text in SQL_QUERIES.items():
+        text = "\n".join(line.strip() for line in sql_text.strip().splitlines())
+        if name in existing:
+            w.queries.update(existing[name], update_mask="query_text,warehouse_id",
+                             query=dbsql.UpdateQueryRequestQuery(query_text=text, warehouse_id=wh.id))
+            print(f"[sql] consulta atualizada: {name}")
+        else:
+            w.queries.create(query=dbsql.CreateQueryRequestQuery(display_name=name, query_text=text,
+                                                                 warehouse_id=wh.id, parent_path=folder))
+            print(f"[sql] consulta criada:     {name}")
+
+    # 4) Dashboard: o mesmo princípio (atualiza se já existir com este nome)
+    from databricks.sdk.service.dashboards import Dashboard
+    definition = dashboard_json()
+    found = next((d for d in w.lakeview.list() if d.display_name == DASHBOARD_NAME), None)
+    fields = dict(display_name=DASHBOARD_NAME, serialized_dashboard=definition, warehouse_id=wh.id)
+    try:   # versões recentes do SDK recebem um objeto Dashboard; as antigas recebem os campos diretamente
+        if found:
+            dash = w.lakeview.update(found.dashboard_id, dashboard=Dashboard(**fields))
+        else:
+            dash = w.lakeview.create(dashboard=Dashboard(parent_path=folder, **fields))
+    except TypeError:
+        if found:
+            dash = w.lakeview.update(found.dashboard_id, **fields)
+        else:
+            dash = w.lakeview.create(parent_path=folder, **fields)
+    print(f"[sql] dashboard {'atualizado' if found else 'criado'}: {DASHBOARD_NAME}")
+    w.lakeview.publish(dash.dashboard_id, warehouse_id=wh.id, embed_credentials=True)
+    print(f"[sql] dashboard publicado. Abrir em Dashboards ou em {folder}")
+
+
+if ANALISE and PUBLICAR_SQL:
+    try:
+        publicar_sql()
+    except Exception as e:
+        print(f"[aviso] publicação automática não concluída ({type(e).__name__}: {str(e)[:200]}).\n"
+              "        Os resultados acima não são afetados. Criar à mão seguindo queries_e_dashboard.md.")
 
 # COMMAND ----------
 

@@ -1,0 +1,72 @@
+# Job do Databricks: pipeline Medallion dos filmes (IMDb + TMDB + MovieLens)
+#
+# Como usar (Free Edition):
+#   1. Jobs & Pipelines > Create > Job.
+#   2. Menu "⋮" no canto superior direito > "Edit as YAML" (ou "View as code" > YAML).
+#   3. Colar este conteúdo e substituir NOTEBOOK_PATH pelo caminho real do notebook,
+#      e DASHBOARD_ID / WAREHOUSE_ID pelos códigos impressos na secção 6.1 do notebook
+#      (no notebook: menu File > Copy path, ex.: /Workspace/Users/<o-teu-email>/movies_medallion_project_v3).
+#   4. Save > Run now. No separador Runs, abrir a execução para ver o grafo das tarefas.
+#
+# Sem bloco de cluster: na Free Edition as tarefas correm em computação serverless.
+# As três fontes correm em paralelo; a integração só arranca quando as três terminam.
+# A última tarefa atualiza o dashboard com os dados novos.
+
+name: filmes_medallion
+max_concurrent_runs: 1
+
+parameters:
+  - name: catalog
+    default: abd_project
+  - name: reiniciar          # sempre "nao" num Job (o notebook recusa outro valor fora de etapa = tudo)
+    default: nao
+
+tasks:
+  - task_key: tmdb
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: tmdb}
+
+  - task_key: imdb
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: imdb}
+
+  - task_key: movielens
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: movielens}
+
+  - task_key: integracao
+    depends_on: [{task_key: tmdb}, {task_key: imdb}, {task_key: movielens}]
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: integracao}
+
+  - task_key: gold
+    depends_on: [{task_key: integracao}]
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: gold}
+
+  - task_key: analise
+    depends_on: [{task_key: gold}]
+    notebook_task:
+      notebook_path: NOTEBOOK_PATH
+      base_parameters: {etapa: analise}
+
+  # Atualiza o dashboard criado pela secção 6.1 do notebook, no fim do pipeline.
+  # Substituir DASHBOARD_ID e WAREHOUSE_ID pelos códigos que o notebook imprime ("[sql] dashboard_id = ...").
+  # Se ainda não correram a secção 6.1, apagar esta tarefa até o dashboard existir.
+  - task_key: dashboard
+    depends_on: [{task_key: analise}]
+    dashboard_task:
+      dashboard_id: DASHBOARD_ID
+      warehouse_id: WAREHOUSE_ID
+
+# Opcional: correr sempre que chega um ficheiro novo ao Volume (ingestão incremental automática).
+# Descomentar e ajustar o catálogo.
+# trigger:
+#   file_arrival:
+#     url: /Volumes/abd_project/bronze/raw/
+#   pause_status: UNPAUSED
