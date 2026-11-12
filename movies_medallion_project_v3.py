@@ -5,15 +5,15 @@
 # ///
 # MAGIC %md
 # MAGIC # Projeto de grupo: as notas dos filmes dependem de quem as dá?
-# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (Arquitetura Medallion) seguindo o CRISP-DM
+# MAGIC ### IMDb + TMDB + MovieLens num Data Lakehouse (arquitetura Medallion) seguindo o CRISP-DM
 # MAGIC
 # MAGIC **Grupo:** _(nome do grupo)_
-# MAGIC **Elementos:** _(Francisco Monteiro, nº 20251694)_ · _(José Grave, nº 20251843)_ · _(Luís Pousada, nº)_ · _(Tiago Felgueira, nº20242047)_
+# MAGIC **Elementos:** _(nome 1, nº)_ · _(nome 2, nº)_ · _(nome 3, nº)_ · _(nome 4, nº)_
 # MAGIC **Curso:** Analyzing Big Data 2026, NOVA IMS  |  **Data de entrega:** 16/11/2026
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### Organização do notebook
+# MAGIC ### Como este notebook está organizado
 # MAGIC
 # MAGIC Usamos duas ideias que se complementam:
 # MAGIC
@@ -48,7 +48,7 @@
 # MAGIC
 # MAGIC **Padrões de PySpark que aparecem muitas vezes:**
 # MAGIC * `F.col("x")` refere uma coluna; `withColumn` cria ou substitui uma coluna; `groupBy(...).agg(...)` agrega; `join` junta tabelas.
-# MAGIC * `Window.partitionBy(...).orderBy(...)` faz contas "por grupo sem agrupar".
+# MAGIC * `Window.partitionBy(...).orderBy(...)` faz contas "por grupo sem agrupar" (ex.: ficar com a linha mais recente de cada filme).
 # MAGIC * `lambda p: ...` é uma função pequena sem nome; usamo-la para dizer *como* se lê um ficheiro, deixando a outra função decidir *se* o lê.
 # MAGIC * Nada é calculado até haver uma ação (`count`, `write`, `display`): o Spark é *lazy* e só executa no fim.
 
@@ -59,15 +59,25 @@
 # MAGIC
 # MAGIC Esta célula corre sempre primeiro. Lê os parâmetros (widgets), confirma o ambiente, define as funções auxiliares e **verifica todos os objetos que já existem** antes de mexer em qualquer um.
 # MAGIC
+# MAGIC **A arquitetura Medallion é criada aqui.** Na primeira execução o setup cria, por esta ordem, o catálogo `abd_project`, os schemas `bronze`, `silver` e `gold` (cada um com uma descrição no Unity Catalog) e o Volume `bronze.raw` com uma pasta por fonte. Nas execuções seguintes encontra-os e mantém-nos.
+# MAGIC
+# MAGIC ```
+# MAGIC abd_project                  (catálogo)
+# MAGIC ├── bronze                   (schema)  dados brutos + histórico de leituras
+# MAGIC │   └── raw                  (Volume)  tmdb/  imdb/  movielens/
+# MAGIC ├── silver                   (schema)  dados limpos e integrados
+# MAGIC └── gold                     (schema)  tabelas para análise e star schema
+# MAGIC ```
+# MAGIC
 # MAGIC **Regras para não perder dados nem ter erros ao voltar a correr**
 # MAGIC
 # MAGIC | Objeto | Se não existe | Se já existe |
 # MAGIC |---|---|---|
-# MAGIC | Catálogo | erro com instruções (não é criado pelo notebook) | usado |
+# MAGIC | Catálogo | criado (se a conta não deixar, erro com instruções) | mantido |
 # MAGIC | Schemas `bronze`, `silver`, `gold` e Volume `raw` | criados | mantidos, nunca apagados |
-# MAGIC | Ficheiros no Volume | erro só se a tabela bronze também não existir | lidos; nunca apagados nem alterados |
+# MAGIC | Ficheiros no Volume | erro só se a tabela bronze também não existir | lidos **só se forem novos** (nome e data comparados com a bronze antes de ler); nunca apagados nem alterados |
 # MAGIC | Tabelas **bronze** | criadas na 1.ª ingestão | **só append** de ficheiros novos; tabelas de versões antigas são **migradas** (colunas novas, linhas mantidas); histórico Delta guardado 90 dias |
-# MAGIC | Tabelas **silver** e **gold** | criadas | reconstruídas a partir da camada anterior (escrita atómica; a versão anterior fica no histórico Delta) |
+# MAGIC | Tabelas **silver** e **gold** | criadas | reconstruídas a partir da camada anterior (escrita atómica; a versão anterior fica no histórico Delta). A chave é verificada depois de gravar: se houver duplicados, a versão anterior é reposta automaticamente |
 # MAGIC | `gold.dq_results` | criada | só append (histórico da qualidade) |
 # MAGIC
 # MAGIC O widget `reiniciar` tem três opções:
@@ -86,7 +96,6 @@ import uuid
 
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter, MaxNLocator
-from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 from pyspark.sql import Window
@@ -101,10 +110,14 @@ dbutils.widgets.dropdown("reiniciar", "nao", ["nao", "silver_gold", "tudo_com_ba
 dbutils.widgets.text("min_imdb_votes", "1000", "Mín. votos IMDb")
 dbutils.widgets.text("min_ml_ratings", "10", "Mín. avaliações MovieLens")
 dbutils.widgets.text("min_tmdb_votes", "20", "Mín. votos TMDB")
+dbutils.widgets.dropdown("publicar_sql", "sim", ["sim", "nao"], "Publicar consultas e dashboard")
+dbutils.widgets.dropdown("otimizar", "nao", ["nao", "sim"], "Correr OPTIMIZE (secção 5.11)")
 
 CATALOG        = dbutils.widgets.get("catalog").strip()
 ETAPA          = dbutils.widgets.get("etapa")
 REINICIAR      = dbutils.widgets.get("reiniciar")   # nao | silver_gold | tudo_com_backup
+PUBLICAR_SQL   = dbutils.widgets.get("publicar_sql") == "sim"   # secção 6.1
+OTIMIZAR       = dbutils.widgets.get("otimizar") == "sim"       # secção 5.11 (demora: só quando há dados novos)
 
 
 def _int_widget(name, default):
@@ -181,12 +194,27 @@ def run_check(name, fn, critical=True):
         results.append((name, "FAIL" if critical else "WARN", f"{type(e).__name__}: {e}"))
 
 
-def check_catalog():
-    catalogs = [r[0] for r in spark.sql("SHOW CATALOGS").collect()]
-    if CATALOG not in catalogs:
-        raise RuntimeError(f"Catálogo '{CATALOG}' não existe. Cria-o em Catalog > + > Create catalog, "
-                           f"ou escolhe outro no widget. Disponíveis: {catalogs}")
-    return f"Catálogo '{CATALOG}' já existia"
+def catalog_exists():
+    return CATALOG in [r[0] for r in spark.sql("SHOW CATALOGS").collect()]
+
+
+def ensure_catalog():
+    """Cria o catálogo só se não existir. Nunca apaga nada."""
+    if catalog_exists():
+        return f"Catálogo '{CATALOG}' já existia (mantido)"
+    try:
+        spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG} COMMENT 'Projeto filmes: arquitetura Medallion'")
+    except Exception as e:
+        if not catalog_exists():
+            raise RuntimeError(f"Não foi possível criar o catálogo '{CATALOG}' ({type(e).__name__}). "
+                               "Cria-o em Catalog > + > Create catalog, ou escolhe outro no widget.")
+    return f"Catálogo '{CATALOG}' criado"
+
+
+# Descrição de cada camada, guardada no Unity Catalog quando o schema é criado
+LAYER_COMMENTS = {"bronze": "Bronze: dados brutos tal como chegam, com histórico de todas as leituras (só append)",
+                  "silver": "Silver: dados limpos, tipados, sem duplicados e integrados entre fontes",
+                  "gold":   "Gold: tabelas prontas para análise (hipóteses, star schema, benchmarking)"}
 
 
 def schema_exists(schema):
@@ -199,7 +227,7 @@ def ensure_schema(schema):
         if schema_exists(schema):
             return f"{CATALOG}.{schema} já existia (mantido)"
         try:
-            spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{schema}")
+            spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{schema} COMMENT '{LAYER_COMMENTS.get(schema, '')}'")
         except Exception:
             if not schema_exists(schema):   # outra tarefa do Job pode tê-lo criado ao mesmo tempo
                 raise
@@ -250,6 +278,15 @@ def source_files(source, key):
         return []
 
 
+def source_file_infos(source, key):
+    """Como source_files, mas com o caminho completo e a data de modificação de cada ficheiro."""
+    stem, ext = file_pattern(source, key)
+    try:
+        return [f for f in dbutils.fs.ls(SOURCES[source]) if f.name.startswith(stem) and f.name.endswith(ext)]
+    except Exception:
+        return []
+
+
 def missing_files(source):
     return [FILES[source][k] for k in FILES[source] if not source_files(source, k)]
 
@@ -265,7 +302,8 @@ def check_source_files(source):
 
 
 run_check("Sessão Spark", lambda: f"Spark {spark.version}")
-run_check("Catálogo", check_catalog)
+# Arquitetura Medallion: catálogo -> schemas bronze, silver, gold -> Volume bronze.raw (criados se faltarem)
+run_check("Catálogo", ensure_catalog)
 for _schema in LAYERS:
     run_check(f"Schema {_schema}", ensure_schema(_schema))
 run_check("Volume bronze.raw", ensure_volume)
@@ -350,6 +388,15 @@ def migrate_bronze(full):
     return True
 
 
+def rows_written(full):
+    """Nº de linhas da última escrita, lido do histórico Delta (sem voltar a ler os dados)."""
+    try:
+        metrics = spark.sql(f"DESCRIBE HISTORY {full} LIMIT 1").first()["operationMetrics"] or {}
+        return int(metrics["numOutputRows"])
+    except Exception:
+        return None
+
+
 def ingest_bronze(df, name, source, comment=None):
     """Ingestão INCREMENTAL para a bronze (só append, nunca overwrite).
 
@@ -361,22 +408,34 @@ def ingest_bronze(df, name, source, comment=None):
     df = with_audit(df, source)
     exists = spark.catalog.tableExists(full)
     if exists:
-        migrate_bronze(full)
         history = spark.table(full).select("_source_file", "_file_modified").distinct()
         known = history.where(F.col("_file_modified").isNotNull())
         # linhas 'legado' não têm data do ficheiro: o mesmo caminho conta como já lido
         legacy_paths = history.where(F.col("_file_modified").isNull()).select("_source_file").distinct()
         df = (df.join(F.broadcast(known), ["_source_file", "_file_modified"], "left_anti")
                 .join(F.broadcast(legacy_paths), "_source_file", "left_anti"))
-    n_new = df.count()
-    if n_new == 0:
-        print(f"[bronze] {full}: sem ficheiros novos, nada acrescentado")
-        return
+    # Grava diretamente (sem count() antes, que obrigaria a ler os ficheiros duas vezes).
+    # O anti-join acima é só uma rede de segurança: os ficheiros já lidos foram excluídos antes.
     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(full)
     if not exists:
         protect_bronze(full)
     set_comment(full, comment)
+    n_new = rows_written(full)
+    if n_new is None:   # se o histórico não tiver a métrica, conta só o lote desta execução
+        n_new = spark.table(full).where(F.col("_batch_id") == BATCH_ID).count()
     print(f"[bronze] {full}: +{n_new:,} linhas (lote {BATCH_ID})")
+
+
+def read_files_known(full):
+    """Ficheiros já lidos para uma tabela bronze: {(nome, data em segundos)} e nomes 'legado' sem data.
+    Lê só duas colunas da bronze, por isso é rápido mesmo com muitas linhas."""
+    rows = (spark.table(full)
+            .select(F.element_at(F.split("_source_file", "/"), -1).alias("name"),
+                    F.expr("floor(unix_millis(_file_modified) / 1000)").alias("sec"))
+            .distinct().collect())
+    known = {(r["name"], r["sec"]) for r in rows if r["sec"] is not None}
+    legacy = {r["name"] for r in rows if r["sec"] is None}
+    return known, legacy
 
 
 def ingest_source_table(source, key, table, reader, comment):
@@ -384,16 +443,38 @@ def ingest_source_table(source, key, table, reader, comment):
     * há ficheiros no Volume            -> ingestão incremental;
     * não há ficheiros mas a tabela existe -> mantém o histórico já guardado (sem erro);
     * não há ficheiros nem tabela       -> erro com instruções.
-    'reader' é uma função que recebe o caminho dos ficheiros e devolve um DataFrame
+    'reader' é uma função que recebe a lista de ficheiros a ler e devolve um DataFrame
     (ex.: lambda p: spark.read.json(p)). Só é chamada se houver ficheiros."""
     full = tbl(BRONZE, table)
-    if source_files(source, key):
-        ingest_bronze(reader(source_glob(source, key)), table, source, comment)
+    files = source_file_infos(source, key)
+    if files:
+        # Antes de ler, compara a lista de ficheiros com o que a bronze já tem: só os novos são lidos.
+        if spark.catalog.tableExists(full):
+            migrate_bronze(full)
+            known, legacy = read_files_known(full)
+            files = [f for f in files
+                     if (f.name, f.modificationTime // 1000) not in known and f.name not in legacy]
+        if not files:
+            print(f"[bronze] {full}: sem ficheiros novos, nada lido")
+            return
+        paths = [f.path.replace("dbfs:/Volumes/", "/Volumes/", 1) for f in files]
+        ingest_bronze(reader(paths), table, source, comment)
     elif spark.catalog.tableExists(full):
         print(f"[bronze] {full}: não há '{FILES[source][key]}' no Volume; mantém-se o histórico já guardado")
     else:
         raise FileNotFoundError(f"Falta '{FILES[source][key]}' em {SOURCES[source]} e a tabela {full} ainda não existe. "
                                 "Carrega o ficheiro em Catalog > bronze > raw > Upload to this volume.")
+
+
+def bronze_atual(name):
+    """Bronze sem leituras repetidas: de cada ficheiro fica só a leitura mais recente.
+    A bronze guarda o histórico todo; a silver só precisa da última versão de cada ficheiro.
+    Reduz as linhas que entram no latest() (que ordena por chave), e a diferença cresce com cada lote."""
+    df = (spark.table(tbl(BRONZE, name))
+          .withColumn("_file", F.coalesce(F.element_at(F.split("_source_file", "/"), -1), F.lit("legado")))
+          .withColumn("_t", F.coalesce("_ingested_at", F.lit("1970-01-01").cast("timestamp"))))
+    last_read = df.groupBy("_file").agg(F.max("_t").alias("_t"))
+    return df.join(F.broadcast(last_read), ["_file", "_t"]).drop("_file", "_t")
 
 
 def latest(df, keys, order_cols=("_ingested_at",)):
@@ -429,9 +510,21 @@ def imdb_tconst(col_name):
             .otherwise(F.concat(F.lit("tt"), F.when(F.length(c) < 7, F.lpad(c, 7, "0")).otherwise(c)))
 
 
-def write_delta(df, layer, name, cluster_by=None, comment=None):
+def restore_previous(full):
+    """Volta a tabela à versão anterior (ou apaga-a, se acabou de ser criada)."""
+    versions = spark.sql(f"DESCRIBE HISTORY {full} LIMIT 2").collect()
+    if len(versions) == 2:
+        spark.sql(f"RESTORE TABLE {full} TO VERSION AS OF {versions[1]['version']}")
+        print(f"[qualidade] {full}: reposta a versão {versions[1]['version']}")
+    else:
+        spark.sql(f"DROP TABLE {full}")
+
+
+def write_delta(df, layer, name, cluster_by=None, comment=None, key=None):
     """Silver e gold: reescreve a tabela a partir da camada anterior (idempotente),
-    opcionalmente com Liquid Clustering, e devolve o DataFrame lido da tabela."""
+    opcionalmente com Liquid Clustering, e devolve o DataFrame lido da tabela.
+    Com key=..., verifica depois de gravar que a chave é única (sobre a tabela gravada, para não
+    calcular as transformações duas vezes). Se não for, repõe a versão anterior e dá erro."""
     full = tbl(layer, name)
     if cluster_by:
         view = f"_w_{uuid.uuid4().hex[:8]}"
@@ -442,7 +535,14 @@ def write_delta(df, layer, name, cluster_by=None, comment=None):
         df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(full)
     set_comment(full, comment)
     out = spark.table(full)
-    print(f"[{layer}] {full}: {out.count():,} linhas")
+    if key is not None:
+        try:
+            assert_unique(out, key, f"{layer}.{name}")
+        except ValueError:
+            restore_previous(full)
+            raise
+    n = rows_written(full)
+    print(f"[{layer}] {full}: {(n if n is not None else out.count()):,} linhas")
     return out
 
 
@@ -466,25 +566,36 @@ def require_tables(layer, names, etapa_anterior):
 # ------------------------- 4. Pipeline visual ---------------------------------
 # [Auxiliar] Desenho em SVG (texto que o browser transforma em imagem). Só serve para mostrar
 # o estado do pipeline; não é preciso perceber o código de desenho.
-def _layer_state(tables):
-    """(nº tabelas existentes, nº esperadas, total de linhas)."""
-    existing = [t for t in tables if spark.catalog.tableExists(t)]
-    rows = sum(spark.table(t).count() for t in existing)
-    return len(existing), len(tables), rows
+def existing_tables():
+    """Todas as tabelas que já existem nas três camadas: 3 consultas SHOW TABLES em vez de uma por tabela."""
+    found = set()
+    for layer in LAYERS:
+        try:
+            found |= {tbl(layer, r.tableName) for r in spark.sql(f"SHOW TABLES IN {CATALOG}.{layer}").collect()
+                      if not r.isTemporary}
+        except Exception:   # schema ainda não existe
+            pass
+    return found
+
+
+def _layer_state(tables, existing):
+    """(nº tabelas existentes, nº esperadas). Não conta linhas: seria uma consulta por tabela."""
+    return sum(t in existing for t in tables), len(tables)
 
 
 def mostrar_pipeline(titulo="Estado do pipeline"):
     """Desenha o pipeline Medallion e pinta cada caixa conforme o estado das tabelas:
     verde = todas criadas, amarelo = parcial, cinzento = ainda por correr."""
     colors = {"full": ("#d4edda", "#2e7d32"), "partial": ("#fff3cd", "#b8860b"), "none": ("#eeeeee", "#9e9e9e")}
+    existing = existing_tables()
 
     def box(x, y, title, tables, w=180, h=64):
-        done, total, rows = _layer_state(tables)
+        done, total = _layer_state(tables, existing)
         state = "full" if done == total else ("partial" if done else "none")
         fill, stroke = colors[state]
         return (f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
                 f'<text x="{x + w / 2}" y="{y + 24}" text-anchor="middle" font-weight="bold" font-size="13">{title}</text>'
-                f'<text x="{x + w / 2}" y="{y + 44}" text-anchor="middle" font-size="11">{done}/{total} tabelas · {rows:,} linhas</text>')
+                f'<text x="{x + w / 2}" y="{y + 44}" text-anchor="middle" font-size="11">{done}/{total} tabelas</text>')
 
     def file_box(x, y, title, source, w=150, h=64):
         try:
@@ -547,17 +658,13 @@ if _fails:
 
 # ------------------- 7. Objetos existentes e ação prevista --------------------
 # [Auxiliar] Inventário: para cada tabela diz se já existe e o que o notebook vai fazer com ela.
-def table_info(layer, name):
-    """Estado atual de uma tabela: existe?, linhas, última alteração e colunas."""
+def table_info(layer, name, existing):
+    """Estado atual de uma tabela: existe? e, na bronze, as colunas (para saber se precisa de migração).
+    Não conta linhas nem lê detalhes: no serverless cada consulta extra custa segundos."""
     full = tbl(layer, name)
-    if not spark.catalog.tableExists(full):
-        return {"existe": False, "linhas": None, "ultima_alteracao": None, "colunas": []}
-    df = spark.table(full)
-    try:
-        last = str(spark.sql(f"DESCRIBE DETAIL {full}").first()["lastModified"])
-    except Exception:
-        last = None
-    return {"existe": True, "linhas": df.count(), "ultima_alteracao": last, "colunas": df.columns}
+    if full not in existing:
+        return {"existe": False, "colunas": []}
+    return {"existe": True, "colunas": spark.table(full).columns if layer == BRONZE else []}
 
 
 def source_of(name):
@@ -592,14 +699,13 @@ def planned_action(layer, name, info):
 EXPECTED_TABLES = ([(BRONZE, t) for names in BRONZE_TABLES.values() for t in names]
                    + [(SILVER, t) for names in SILVER_TABLES.values() for t in names] + [(SILVER, "movies_unified")]
                    + [(GOLD, t) for t in STAR_TABLES + GOLD_TABLES])
+_existing = existing_tables()
 _objects = []
 for _layer, _name in EXPECTED_TABLES:
-    _info = table_info(_layer, _name)
-    _objects.append((_layer, _name, _info["existe"], _info["linhas"], _info["ultima_alteracao"],
-                     planned_action(_layer, _name, _info)))
+    _info = table_info(_layer, _name, _existing)
+    _objects.append((_layer, _name, _info["existe"], planned_action(_layer, _name, _info)))
 print(f"Objetos existentes: {sum(o[2] for o in _objects)} de {len(_objects)} tabelas | reiniciar = {REINICIAR}")
-display(spark.createDataFrame(_objects, "camada string, tabela string, existe boolean, linhas long, "
-                                        "ultima_alteracao string, acao_prevista string"))
+display(spark.createDataFrame(_objects, "camada string, tabela string, existe boolean, acao_prevista string"))
 
 
 # ------------------- 8. Reinício seguro (opcional) ----------------------------
@@ -643,7 +749,8 @@ if REINICIAR != "nao":
     print("Reinício concluído. Os ficheiros do Volume não foram alterados.")
 
 print(f"Setup válido | etapa = {ETAPA} | lote = {BATCH_ID}")
-mostrar_pipeline("Estado do pipeline antes de correr")
+if ETAPA == "tudo":   # numa tarefa de Job não é preciso: o Job já mostra o grafo
+    mostrar_pipeline("Estado do pipeline antes de correr")
 
 # COMMAND ----------
 
@@ -676,15 +783,14 @@ mostrar_pipeline("Estado do pipeline antes de correr")
 # MAGIC
 # MAGIC | | Camada | Onde fica | O que contém | Regra principal |
 # MAGIC |---|---|---|---|---|
-# MAGIC | **Fontes**  | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
-# MAGIC | **Bronze**  | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
-# MAGIC | **Silver**  | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
-# MAGIC | **Gold**    | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
+# MAGIC | **Fontes** | descarregadas localmente (a Free Edition não acede à internet) | IMDb (TSV), TMDB (JSON), MovieLens (CSV) | ficheiros originais, sem alterações |
+# MAGIC | **Bronze** | Volume `bronze.raw` + tabelas `bronze.*` | dados brutos em string + auditoria (`_batch_id`, `_source_file`, `_ingested_at`) | só **append**: guarda o histórico de todas as leituras |
+# MAGIC | **Silver** | tabelas `silver.*` | dados limpos, tipados, sem duplicados; `movies_unified` integra as 3 fontes | versão mais recente de cada chave; reconstruível a partir da bronze |
+# MAGIC |  **Gold** | tabelas `gold.*` | agregados por década, género, idioma e orçamento; modelo; qualidade | uma tabela por hipótese, pronta para gráficos |
 # MAGIC | **Consumo** | este notebook e o Job | 10 gráficos, regressão, conclusões | lê só a gold |
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 6
 # [Auxiliar] Diagrama em HTML/CSS: cartões coloridos lado a lado. Não é preciso perceber o HTML.
 def mostrar_arquitetura():
     """Diagrama da arquitetura (HTML/CSS: fica visível no notebook e no export HTML)."""
@@ -762,6 +868,8 @@ def bronze_tmdb():
     ingest_source_table("tmdb", "details", "tmdb_movie_details",
                         lambda p: spark.read.schema("movie_id long, payload string").json(p),
                         "TMDB: detalhe por filme (JSON bruto, histórico de leituras)")
+
+
 if correr("tmdb"):
     bronze_tmdb()
 
@@ -839,7 +947,7 @@ if correr("analise"):
         for _p in _parts[1:]:
             _df = _df.unionByName(_p)
         batches = _df.toPandas().pivot_table(index="tabela", columns="_batch_id", values="count", fill_value=0)
- 
+
         fig, ax = plt.subplots(figsize=(10, 4.5))
         batches.plot.barh(ax=ax, colormap="tab10", width=0.8)   # uma barra por lote
         ax.set_xscale("log")
@@ -881,7 +989,7 @@ DETAIL_DDL = ("id long, imdb_id string, title string, original_title string, ori
 def silver_tmdb():
     require_tables(BRONZE, ["tmdb_movie_lists", "tmdb_movie_details"], "tmdb")
     # Filmes das listas: a versão mais recente de cada filme + todas as listas onde apareceu
-    lists = (spark.table(tbl(BRONZE, "tmdb_movie_lists"))
+    lists = (bronze_atual("tmdb_movie_lists")
              .select("list_name", "_ingested_at", F.from_json("payload", LIST_MOVIE_DDL).alias("m"))
              .select("list_name", "_ingested_at", F.col("m.id").alias("tmdb_id"), "m.*")
              .where(F.col("tmdb_id").isNotNull()))
@@ -891,12 +999,11 @@ def silver_tmdb():
                    .select("tmdb_id", "title", "original_title", "original_language", "overview",
                            safe_date("release_date").alias("release_date"),
                            "popularity", "vote_average", "vote_count", "lists"))
-    assert_unique(tmdb_movies, "tmdb_id", "silver.tmdb_movies")
-    write_delta(tmdb_movies, SILVER, "tmdb_movies",
+    write_delta(tmdb_movies, SILVER, "tmdb_movies", key="tmdb_id",
                 comment="TMDB: filmes das listas, um por tmdb_id, com as listas em que aparecem")
 
     # Detalhe por filme: a versão mais recente de cada tmdb_id
-    details = (spark.table(tbl(BRONZE, "tmdb_movie_details"))
+    details = (bronze_atual("tmdb_movie_details")
                .select("_ingested_at", F.from_json("payload", DETAIL_DDL).alias("d"))
                .select("_ingested_at", "d.*")
                .where(F.col("id").isNotNull()))
@@ -905,8 +1012,7 @@ def silver_tmdb():
                             "original_language", "overview", safe_date("release_date").alias("release_date"),
                             F.col("runtime").alias("runtime_minutes"), "budget", "revenue", "status",
                             "popularity", "vote_average", "vote_count", "genres"))
-    assert_unique(tmdb_details, "tmdb_id", "silver.tmdb_movie_details")
-    tmdb_details = write_delta(tmdb_details, SILVER, "tmdb_movie_details",
+    tmdb_details = write_delta(tmdb_details, SILVER, "tmdb_movie_details", key="tmdb_id",
                                comment="TMDB: detalhe tipado (orçamento, receita, duração, géneros), versão mais recente")
 
     tmdb_genres = (tmdb_details.select("tmdb_id", F.explode("genres").alias("g"))
@@ -922,8 +1028,8 @@ if correr("tmdb"):
 # ----------------------------- SILVER · IMDb ---------------------------------
 def silver_imdb():
     require_tables(BRONZE, ["imdb_title_basics", "imdb_title_ratings"], "imdb")
-    basics  = latest(nullify(spark.table(tbl(BRONZE, "imdb_title_basics"))), ["tconst"])
-    ratings = latest(nullify(spark.table(tbl(BRONZE, "imdb_title_ratings"))), ["tconst"])
+    basics  = latest(nullify(bronze_atual("imdb_title_basics")), ["tconst"])
+    ratings = latest(nullify(bronze_atual("imdb_title_ratings")), ["tconst"])
 
     imdb_ratings = ratings.select("tconst",
                                   try_cast("averageRating", "double").alias("imdb_rating"),
@@ -940,8 +1046,7 @@ def silver_imdb():
         .where(~F.col("is_adult"))
         .join(imdb_ratings, "tconst", "left")
     )
-    assert_unique(imdb_movies, "tconst", "silver.imdb_movies")
-    imdb_movies = write_delta(imdb_movies, SILVER, "imdb_movies", cluster_by=["start_year"],
+    imdb_movies = write_delta(imdb_movies, SILVER, "imdb_movies", cluster_by=["start_year"], key="tconst",
                               comment="IMDb: filmes não adultos, tipados, com nota e votos (Liquid Clustering por start_year)")
     write_delta(imdb_movies.select("tconst", F.explode("genres").alias("genre")), SILVER, "imdb_movie_genres",
                 comment="IMDb: relação filme-género (nomes em inglês)")
@@ -960,7 +1065,7 @@ def silver_movielens():
     require_tables(BRONZE, ["ml_ratings", "ml_movies", "ml_links", "ml_tags"], "movielens")
     # Avaliações: uma por (utilizador, filme); se houver repetidas fica a mais recente
     ml_ratings = (
-        spark.table(tbl(BRONZE, "ml_ratings"))
+        bronze_atual("ml_ratings")
         .select(try_cast("userId", "int").alias("user_id"),
                 try_cast("movieId", "int").alias("movie_id"),
                 try_cast("rating", "double").alias("rating"),
@@ -970,12 +1075,11 @@ def silver_movielens():
                & F.col("rating").between(0.5, 5.0))
     )
     ml_ratings = latest(ml_ratings, ["user_id", "movie_id"], ("_ingested_at", "rated_at")).drop("_ingested_at")
-    assert_unique(ml_ratings, ["user_id", "movie_id"], "silver.ml_ratings")
-    write_delta(ml_ratings, SILVER, "ml_ratings", cluster_by=["movie_id"],
+    write_delta(ml_ratings, SILVER, "ml_ratings", cluster_by=["movie_id"], key=["user_id", "movie_id"],
                 comment="MovieLens: uma avaliação por utilizador e filme (escala 0.5 a 5)")
 
     ml_movies = (
-        latest(spark.table(tbl(BRONZE, "ml_movies")), ["movieId"])
+        latest(bronze_atual("ml_movies"), ["movieId"])
         .select(try_cast("movieId", "int").alias("movie_id"),
                 F.trim(F.regexp_replace("title", YEAR_PATTERN, "")).alias("title"),
                 F.when(F.regexp_extract("title", YEAR_PATTERN, 1) != "",
@@ -984,21 +1088,19 @@ def silver_movielens():
                          lambda g: (g != "") & (g != "(no genres listed)")).alias("genres"))
         .where(F.col("movie_id").isNotNull())
     )
-    assert_unique(ml_movies, "movie_id", "silver.ml_movies")
-    write_delta(ml_movies, SILVER, "ml_movies", comment="MovieLens: filmes com título, ano e géneros em array")
+    write_delta(ml_movies, SILVER, "ml_movies", key="movie_id", comment="MovieLens: filmes com título, ano e géneros em array")
 
     ml_links = (
-        latest(spark.table(tbl(BRONZE, "ml_links")), ["movieId"])
+        latest(bronze_atual("ml_links"), ["movieId"])
         .select(try_cast("movieId", "int").alias("movie_id"),
                 imdb_tconst("imdbId").alias("tconst"),          # chave do IMDb (sem cortar 8 dígitos)
                 try_cast("tmdbId", "int").alias("tmdb_id"))     # chave do TMDB
         .where(F.col("movie_id").isNotNull())
     )
-    assert_unique(ml_links, "movie_id", "silver.ml_links")
-    write_delta(ml_links, SILVER, "ml_links", comment="MovieLens: ponte movie_id <-> tconst (IMDb) <-> tmdb_id (TMDB)")
+    write_delta(ml_links, SILVER, "ml_links", key="movie_id", comment="MovieLens: ponte movie_id <-> tconst (IMDb) <-> tmdb_id (TMDB)")
 
     ml_tags = (
-        spark.table(tbl(BRONZE, "ml_tags"))
+        bronze_atual("ml_tags")
         .select(try_cast("userId", "int").alias("user_id"),
                 try_cast("movieId", "int").alias("movie_id"),
                 F.lower(F.trim("tag")).alias("tag"),
@@ -1057,8 +1159,7 @@ def silver_integracao():
     )
     unified.explain(mode="formatted")  # evidência do BroadcastHashJoin para o relatório
 
-    assert_unique(unified, "movie_id", "silver.movies_unified")
-    write_delta(unified, SILVER, "movies_unified", cluster_by=["decade", "start_year"],
+    write_delta(unified, SILVER, "movies_unified", cluster_by=["decade", "start_year"], key="movie_id",
                 comment="Filmes integrados (IMDb + MovieLens + TMDB); ml_rating_10 = nota MovieLens na escala 1-10")
 
 
@@ -1371,19 +1472,14 @@ def gold_star():
                                         F.col("tmdb_vote_average").alias("rating_10"), F.col("tmdb_vote_count").alias("n_votes")))
             .where(F.col("rating_10").isNotNull()))
 
-    # ---- Controlo de qualidade e escrita ----
-    for df, key, name in [(dim_movie, "movie_key", "dim_movie"), (dim_source, "source_key", "dim_source"),
-                          (dim_year, "year_key", "dim_year"), (dim_language, "language_key", "dim_language"),
-                          (dim_genre, "genre_key", "dim_genre"), (bridge, ["movie_key", "genre_key"], "bridge_movie_genre"),
-                          (fact, ["movie_key", "source_key"], "fact_rating")]:
-        assert_unique(df, key, f"gold.{name}")
-    write_delta(dim_movie, GOLD, "dim_movie", comment="Star schema: dimensão filme (atributos descritivos)")
-    write_delta(dim_source, GOLD, "dim_source", comment="Star schema: dimensão fonte da nota")
-    write_delta(dim_year, GOLD, "dim_year", comment="Star schema: dimensão ano de estreia e década")
-    write_delta(dim_language, GOLD, "dim_language", comment="Star schema: dimensão idioma original")
-    write_delta(dim_genre, GOLD, "dim_genre", comment="Star schema: dimensão género (IMDb)")
-    write_delta(bridge, GOLD, "bridge_movie_genre", comment="Star schema: ponte filme-género (muitos-para-muitos)")
-    write_delta(fact, GOLD, "fact_rating", cluster_by=["source_key", "year_key"],
+    # ---- Escrita, com verificação de chave única depois de gravar (key=...) ----
+    write_delta(dim_movie, GOLD, "dim_movie", key="movie_key", comment="Star schema: dimensão filme (atributos descritivos)")
+    write_delta(dim_source, GOLD, "dim_source", key="source_key", comment="Star schema: dimensão fonte da nota")
+    write_delta(dim_year, GOLD, "dim_year", key="year_key", comment="Star schema: dimensão ano de estreia e década")
+    write_delta(dim_language, GOLD, "dim_language", key="language_key", comment="Star schema: dimensão idioma original")
+    write_delta(dim_genre, GOLD, "dim_genre", key="genre_key", comment="Star schema: dimensão género (IMDb)")
+    write_delta(bridge, GOLD, "bridge_movie_genre", key=["movie_key", "genre_key"], comment="Star schema: ponte filme-género (muitos-para-muitos)")
+    write_delta(fact, GOLD, "fact_rating", cluster_by=["source_key", "year_key"], key=["movie_key", "source_key"],
                 comment="Star schema: factos de avaliação, grão = filme x fonte, nota na escala 1-10")
     add_star_constraints()
 
@@ -1630,8 +1726,7 @@ def gold_user_activity():
                 .join(user_flags(after_24h, "_sem_24h"), "user_id", "left")
                 .fillna(False, ["flag_spike_sem_24h", "flag_same_second_sem_24h",
                                 "flag_concentration_sem_24h", "flag_any_sem_24h"]))
-    assert_unique(activity, "user_id", "gold.user_activity")
-    activity = write_delta(activity, GOLD, "user_activity",
+    activity = write_delta(activity, GOLD, "user_activity", key="user_id",
                            comment="Atividade e sinalização por utilizador MovieLens (todas as avaliações e sem as primeiras 24 h)")
 
     # Pergunta 7 (resumo): quantos utilizadores cada regra sinaliza, com e sem as primeiras 24 h
@@ -2107,7 +2202,7 @@ if ANALISE:
 # MAGIC df.write.format("delta").partitionBy("decade").saveAsTable("abd_project.silver.movies_unified")
 # MAGIC ```
 # MAGIC
-# MAGIC A célula seguinte corre `OPTIMIZE`, que aplica o clustering aos dados já escritos, e mostra a organização de cada tabela.
+# MAGIC A célula seguinte mostra a organização de cada tabela. Com o widget `otimizar = sim` corre antes `OPTIMIZE`, que aplica o clustering aos dados já escritos. Está desligado por omissão porque reescreve ficheiros e demora: basta ligá-lo depois de uma carga nova.
 
 # COMMAND ----------
 
@@ -2119,7 +2214,7 @@ if ANALISE:
             continue
         _detail = spark.sql(f"DESCRIBE DETAIL {_full}").first().asDict()
         _cluster = _detail.get("clusteringColumns") or []
-        if _cluster:
+        if _cluster and OTIMIZAR:   # widget otimizar = sim (correr só depois de cargas novas)
             try:
                 spark.sql(f"OPTIMIZE {_full}")   # agrupa os ficheiros pelas colunas de clustering
                 _detail = spark.sql(f"DESCRIBE DETAIL {_full}").first().asDict()
@@ -2311,8 +2406,9 @@ if ANALISE:
 # MAGIC 5. `integracao` (`etapa` = `integracao`), *Depends on*: `tmdb`, `imdb`, `movielens`.
 # MAGIC 6. `gold` (`etapa` = `gold`), *Depends on*: `integracao`.
 # MAGIC 7. `analise` (`etapa` = `analise`), *Depends on*: `gold`.
-# MAGIC 8. **Run now**. No separador **Runs** clicar na execução para ver o grafo; clicar numa tarefa abre o notebook com os outputs e gráficos dessa etapa.
-# MAGIC 9. Opcional: **Schedule** diário, ou **File arrival** no Volume `raw` para correr quando chega um ficheiro novo (ingestão incremental automática).
+# MAGIC 8. Opcional, depois de a secção 6.1 ter publicado o dashboard: `dashboard`, *Type* **Dashboard**, escolher o dashboard **Filmes: as notas dependem de quem as dá?** e o **Serverless Starter Warehouse**, *Depends on*: `analise`.
+# MAGIC 9. **Run now**. No separador **Runs** clicar na execução para ver o grafo; clicar numa tarefa abre o notebook com os outputs e gráficos dessa etapa.
+# MAGIC 10. Opcional: **Schedule** diário, ou **File arrival** no Volume `raw` para correr quando chega um ficheiro novo (ingestão incremental automática).
 # MAGIC
 # MAGIC Em alternativa, o ficheiro `job_filmes_medallion.yml` (entregue com este notebook) tem a definição do Job em código: no Job, menu **⋮ → Edit as YAML** (ou *View as code*) e colar.
 # MAGIC
@@ -2320,15 +2416,220 @@ if ANALISE:
 
 # COMMAND ----------
 
-# Inventário final e estado do pipeline
-inventory = []
-for _layer in LAYERS:
-    for _row in spark.sql(f"SHOW TABLES IN {CATALOG}.{_layer}").collect():
-        if not _row.isTemporary:
-            inventory.append((_layer, _row.tableName, spark.table(tbl(_layer, _row.tableName)).count()))
-if inventory:
-    display(spark.createDataFrame(inventory, "camada string, tabela string, linhas long").orderBy("camada", "tabela"))
-mostrar_pipeline("Estado do pipeline depois de correr")
+# MAGIC %md
+# MAGIC ### 6.1 Consultas SQL guardadas e dashboard (Databricks SQL)
+# MAGIC
+# MAGIC Os gráficos deste notebook servem a análise. Para quem consome os resultados (gestão, outras equipas) o habitual é um **dashboard** alimentado por **consultas SQL guardadas**, que leem só a camada gold.
+# MAGIC
+# MAGIC | # | Consulta | Responde a | Tabela gold |
+# MAGIC |---|---|---|---|
+# MAGIC | Q1 | Nota média por fonte e década | H1, H5 | `ratings_by_decade` |
+# MAGIC | Q2 | Diferença IMDb − MovieLens por género | H2 | `gap_by_genre` |
+# MAGIC | Q3 | Diferença por idioma original | H3 | `gap_by_language` |
+# MAGIC | Q4 | Consenso por escalão de orçamento | H4 | `gap_by_budget` |
+# MAGIC | Q5 | Filmes onde as fontes mais discordam | H1 | `movie_rating_gaps` |
+# MAGIC | Q6 | Nota média por fonte e década, no star schema | 4.2 | `fact_rating` + dimensões |
+# MAGIC | Q7 | Evolução mensal das avaliações | 4.3, pergunta 5 | `ratings_over_time` |
+# MAGIC | Q8 | Utilizadores sinalizados, com e sem as primeiras 24 h | 4.3, perguntas 6-7 | `flag_sensitivity` |
+# MAGIC | Q9 | Qualidade dos dados na última execução | secção 3 | `dq_results` |
+# MAGIC
+# MAGIC **O que as células seguintes fazem (etapa `analise`):**
+# MAGIC 1. Correm as 9 consultas e mostram o resultado (funciona sempre).
+# MAGIC 2. Com o widget `publicar_sql = sim`, guardam-nas em **Queries** e criam (ou atualizam) o dashboard **Filmes: as notas dependem de quem as dá?** em **Dashboards**, na pasta `abd_project_sql` do vosso utilizador. Antes de criar, verificam se já existem com o mesmo nome: se sim, atualizam em vez de duplicar.
+# MAGIC
+# MAGIC Se a publicação automática falhar (permissões, versão da biblioteca), o notebook avisa e continua; nesse caso basta seguir o guia `queries_e_dashboard.md`, que faz o mesmo à mão.
+# MAGIC
+# MAGIC **Como é feito (dashboards as code):**
+# MAGIC 1. **Consultas:** o dicionário `SQL_QUERIES` associa um nome a um SELECT sobre a gold.
+# MAGIC 2. **Queries guardadas:** o Databricks SDK (`WorkspaceClient`) faz por código o que faríamos com cliques: escolhe o SQL Warehouse, cria a pasta e, para cada consulta, `update` se o nome já existe ou `create` se não existe.
+# MAGIC 3. **Dashboard:** um dashboard AI/BI é um JSON com *datasets* (as consultas) e *widgets* (consulta + tipo de gráfico + colunas dos eixos + posição). A lista `DASHBOARD_WIDGETS` descreve os widgets, `dashboard_json()` gera o JSON e o SDK cria ou atualiza o dashboard e publica-o.
+# MAGIC
+# MAGIC **O dashboard como última tarefa do Job.** Depois da primeira publicação, o notebook imprime `dashboard_id` e `warehouse_id`. No Job, acrescentar uma tarefa `dashboard`, do tipo **Dashboard**, que depende de `analise`, escolher o dashboard e o warehouse (ou colar os dois códigos no `job_filmes_medallion.yml`). Cada execução do Job atualiza os dados do dashboard no fim do pipeline:
+# MAGIC ```
+# MAGIC    tmdb ─────┐
+# MAGIC    imdb ─────┼──► integracao ──► gold ──► analise ──► dashboard
+# MAGIC    movielens ┘
+# MAGIC ```
+
+# COMMAND ----------
+
+def gold_tbl(name):
+    return tbl(GOLD, name)
+
+
+# As consultas que alimentam o dashboard. Usam o catálogo do widget, por isso funcionam em qualquer catálogo.
+SQL_QUERIES = {
+    "Q1 - Nota média por fonte e década": f"""
+        SELECT decade, n_movies, avg_imdb, avg_ml, avg_tmdb
+        FROM {gold_tbl('ratings_by_decade')}
+        ORDER BY decade""",
+    "Q2 - Diferença IMDb-MovieLens por género": f"""
+        SELECT genre, n_movies, avg_gap, sd_gap, avg_imdb, avg_ml
+        FROM {gold_tbl('gap_by_genre')}
+        ORDER BY avg_gap DESC""",
+    "Q3 - Diferença por idioma original": f"""
+        SELECT original_language, n_movies, avg_gap_ml, avg_gap_tmdb
+        FROM {gold_tbl('gap_by_language')}
+        ORDER BY n_movies DESC
+        LIMIT 15""",
+    "Q4 - Consenso por escalão de orçamento": f"""
+        SELECT budget_band, n_movies, avg_gap, avg_abs_gap
+        FROM {gold_tbl('gap_by_budget')}
+        ORDER BY budget_band""",
+    "Q5 - Filmes onde as fontes mais discordam": f"""
+        SELECT title, start_year, imdb_rating, ml_rating_10, gap_imdb_ml, imdb_votes, ml_num_ratings
+        FROM {gold_tbl('movie_rating_gaps')}
+        ORDER BY abs_gap DESC
+        LIMIT 20""",
+    "Q6 - Star schema: nota média por fonte e década": f"""
+        SELECT y.decade, s.source_name, ROUND(AVG(f.rating_10), 2) AS nota_media, COUNT(*) AS n
+        FROM {gold_tbl('fact_rating')} f
+        JOIN {gold_tbl('dim_source')} s ON f.source_key = s.source_key
+        JOIN {gold_tbl('dim_year')}   y ON f.year_key   = y.year_key
+        GROUP BY y.decade, s.source_name
+        ORDER BY y.decade, s.source_name""",
+    "Q7 - Evolução mensal das avaliações": f"""
+        SELECT month, n_ratings, avg_rating, n_users
+        FROM {gold_tbl('ratings_over_time')}
+        ORDER BY month""",
+    "Q8 - Utilizadores sinalizados com e sem 24h": f"""
+        SELECT sinalizacao, utilizadores_todas, utilizadores_sem_24h, variacao_pct
+        FROM {gold_tbl('flag_sensitivity')}""",
+    "Q9 - Qualidade dos dados na última execução": f"""
+        SELECT tabela, regra, linhas, violacoes, pct_violacoes, _checked_at
+        FROM {gold_tbl('dq_results')}
+        WHERE _batch_id = (SELECT MAX(_batch_id) FROM {gold_tbl('dq_results')})
+        ORDER BY pct_violacoes DESC""",
+}
+
+if ANALISE:
+    for _name, _sql in SQL_QUERIES.items():
+        print(_name)
+        try:
+            display(spark.sql(_sql))
+        except Exception as e:   # ex.: tabela ainda não criada
+            print(f"  [aviso] não foi possível correr: {type(e).__name__}")
+
+# COMMAND ----------
+
+# [Auxiliar] Publicação das consultas e do dashboard no Databricks SQL, através do Databricks SDK
+# (biblioteca Python oficial, já instalada no Databricks e autenticada com o vosso utilizador).
+# O que interessa perceber: cada widget do dashboard = uma consulta + um tipo de gráfico + as colunas dos eixos.
+import json
+
+DASHBOARD_NAME = "Filmes: as notas dependem de quem as dá?"
+
+# (consulta, tipo de gráfico, coluna do eixo X, colunas do eixo Y, posição x, posição y, largura, altura)
+# A grelha do dashboard tem 6 colunas de largura.
+DASHBOARD_WIDGETS = [
+    ("Q1 - Nota média por fonte e década",         "line",  "decade",            ["avg_imdb", "avg_ml", "avg_tmdb"], 0, 0, 3, 6),
+    ("Q2 - Diferença IMDb-MovieLens por género",   "bar",   "genre",             ["avg_gap"],                        3, 0, 3, 6),
+    ("Q3 - Diferença por idioma original",         "bar",   "original_language", ["avg_gap_ml"],                     0, 6, 3, 6),
+    ("Q4 - Consenso por escalão de orçamento",     "bar",   "budget_band",       ["avg_abs_gap"],                    3, 6, 3, 6),
+    ("Q7 - Evolução mensal das avaliações",        "line",  "month",             ["n_ratings"],                      0, 12, 3, 6),
+    ("Q8 - Utilizadores sinalizados com e sem 24h", "bar",  "sinalizacao",       ["utilizadores_todas", "utilizadores_sem_24h"], 3, 12, 3, 6),
+    ("Q5 - Filmes onde as fontes mais discordam",  "table", None, ["title", "start_year", "imdb_rating", "ml_rating_10", "gap_imdb_ml"], 0, 18, 6, 7),
+    ("Q9 - Qualidade dos dados na última execução", "table", None, ["tabela", "regra", "linhas", "violacoes", "pct_violacoes"], 0, 25, 6, 6),
+]
+
+
+def dashboard_json():
+    """Constrói a definição do dashboard (formato JSON dos AI/BI Dashboards)."""
+    ids = {name: f"q{i + 1}" for i, name in enumerate(SQL_QUERIES)}
+    datasets = [{"name": ids[n], "displayName": n, "queryLines": [" ".join(q.split())]} for n, q in SQL_QUERIES.items()]
+    layout = []
+    for i, (qname, kind, x_col, y_cols, px, py, w, h) in enumerate(DASHBOARD_WIDGETS):
+        cols = ([x_col] if x_col else []) + y_cols
+        query = {"name": "main_query",
+                 "query": {"datasetName": ids[qname], "disaggregated": True,
+                           "fields": [{"name": c, "expression": f"`{c}`"} for c in cols]}}
+        if kind == "table":
+            spec = {"version": 1, "widgetType": "table",
+                    "encodings": {"columns": [{"fieldName": c, "displayName": c} for c in y_cols]}}
+        else:
+            x_scale = "temporal" if x_col == "month" else ("quantitative" if x_col == "decade" else "categorical")
+            spec = {"version": 3, "widgetType": kind,
+                    "encodings": {"x": {"fieldName": x_col, "scale": {"type": x_scale}, "displayName": x_col},
+                                  "y": {"fields": [{"fieldName": c, "displayName": c} for c in y_cols],
+                                        "scale": {"type": "quantitative"}}}}
+        spec["frame"] = {"showTitle": True, "title": qname}
+        layout.append({"widget": {"name": f"w{i + 1}", "queries": [query], "spec": spec},
+                       "position": {"x": px, "y": py, "width": w, "height": h}})
+    return json.dumps({"datasets": datasets,
+                       "pages": [{"name": "principal", "displayName": "Resultados", "layout": layout}]})
+
+
+def publicar_sql():
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service import sql as dbsql
+    w = WorkspaceClient()
+
+    # 1) Warehouse SQL (na Free Edition há um: "Serverless Starter Warehouse")
+    warehouses = list(w.warehouses.list())
+    if not warehouses:
+        raise RuntimeError("não há nenhum SQL Warehouse disponível")
+    wh = next((x for x in warehouses if "starter" in (x.name or "").lower()), warehouses[0])
+
+    # 2) Pasta de destino no workspace do utilizador
+    folder = f"/Users/{w.current_user.me().user_name}/abd_project_sql"
+    w.workspace.mkdirs(folder)
+
+    # 3) Consultas guardadas: verificar se já existe uma com o mesmo nome; se sim atualizar, senão criar
+    existing = {q.display_name: q.id for q in w.queries.list()}
+    for name, sql_text in SQL_QUERIES.items():
+        text = "\n".join(line.strip() for line in sql_text.strip().splitlines())
+        if name in existing:
+            w.queries.update(existing[name], update_mask="query_text,warehouse_id",
+                             query=dbsql.UpdateQueryRequestQuery(query_text=text, warehouse_id=wh.id))
+            print(f"[sql] consulta atualizada: {name}")
+        else:
+            w.queries.create(query=dbsql.CreateQueryRequestQuery(display_name=name, query_text=text,
+                                                                 warehouse_id=wh.id, parent_path=folder))
+            print(f"[sql] consulta criada:     {name}")
+
+    # 4) Dashboard: o mesmo princípio (atualiza se já existir com este nome)
+    from databricks.sdk.service.dashboards import Dashboard
+    definition = dashboard_json()
+    found = next((d for d in w.lakeview.list() if d.display_name == DASHBOARD_NAME), None)
+    fields = dict(display_name=DASHBOARD_NAME, serialized_dashboard=definition, warehouse_id=wh.id)
+    try:   # versões recentes do SDK recebem um objeto Dashboard; as antigas recebem os campos diretamente
+        if found:
+            dash = w.lakeview.update(found.dashboard_id, dashboard=Dashboard(**fields))
+        else:
+            dash = w.lakeview.create(dashboard=Dashboard(parent_path=folder, **fields))
+    except TypeError:
+        if found:
+            dash = w.lakeview.update(found.dashboard_id, **fields)
+        else:
+            dash = w.lakeview.create(parent_path=folder, **fields)
+    print(f"[sql] dashboard {'atualizado' if found else 'criado'}: {DASHBOARD_NAME}")
+    w.lakeview.publish(dash.dashboard_id, warehouse_id=wh.id, embed_credentials=True)
+    print(f"[sql] dashboard publicado. Abrir em Dashboards ou em {folder}")
+    # Estes dois códigos são os que a tarefa 'dashboard' do Job precisa (secção 6.1, passo 3)
+    print(f"[sql] dashboard_id = {dash.dashboard_id}")
+    print(f"[sql] warehouse_id = {wh.id}")
+
+
+if ANALISE and PUBLICAR_SQL:
+    try:
+        publicar_sql()
+    except Exception as e:
+        print(f"[aviso] publicação automática não concluída ({type(e).__name__}: {str(e)[:200]}).\n"
+              "        Os resultados acima não são afetados. Criar à mão seguindo queries_e_dashboard.md.")
+
+# COMMAND ----------
+
+# Inventário final e estado do pipeline: só no fim (etapa tudo ou analise), não em cada tarefa do Job.
+# O nº de linhas vem do histórico Delta (última escrita), sem ler os dados.
+if correr("analise"):
+    inventory = []
+    for _full in sorted(existing_tables()):
+        _n = rows_written(_full)
+        inventory.append((_full.split(".")[-2], _full.split(".")[-1],
+                          _n if _n is not None and not _full.split(".")[-2] == BRONZE else spark.table(_full).count()))
+    if inventory:
+        display(spark.createDataFrame(inventory, "camada string, tabela string, linhas long").orderBy("camada", "tabela"))
+    mostrar_pipeline("Estado do pipeline depois de correr")
 
 # COMMAND ----------
 
