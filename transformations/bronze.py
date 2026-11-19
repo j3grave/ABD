@@ -1,7 +1,7 @@
 """Bronze · ingestão incremental com Auto Loader.
 
 Replica a camada bronze do notebook movies_medallion_project_v3: os ficheiros brutos de
-/Volumes/abd_project/bronze/raw entram tal como vieram (CSV/TSV tudo em string; no JSON o
+/Volumes/abd_project/medallion/raw entram tal como vieram (CSV/TSV tudo em string; no JSON o
 payload guarda o objeto completo como texto), mantendo o histórico de leituras. O Auto
 Loader regista os ficheiros já processados: um ficheiro novo carregado para o Volume
 entra exatamente uma vez, sem duplicados.
@@ -12,7 +12,7 @@ Colunas de auditoria em todas as tabelas: _source, _source_file, _file_modified.
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 
-RAW_ROOT = "/Volumes/abd_project/bronze/raw"
+RAW_ROOT = "/Volumes/abd_project/medallion/raw"
 
 
 def _ingest(source, file_glob, fmt, schema, **options):
@@ -20,6 +20,7 @@ def _ingest(source, file_glob, fmt, schema, **options):
     reader = (
         spark.readStream.format("cloudFiles")
         .option("cloudFiles.format", fmt)
+        .option("cloudFiles.partitionColumns", "")
         .option("pathGlobFilter", file_glob)
     )
     for key, value in options.items():
